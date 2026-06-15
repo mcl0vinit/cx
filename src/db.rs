@@ -77,6 +77,14 @@ pub struct IndexedCodexSessionUpsert {
     pub size_bytes: i64,
 }
 
+#[derive(Debug, Clone)]
+pub struct CachedLimitSnapshot {
+    pub home_path: PathBuf,
+    pub observed_at: String,
+    pub source_path: PathBuf,
+    pub snapshot_json: String,
+}
+
 pub fn connect() -> Result<Connection> {
     paths::ensure_root_dirs()?;
     let conn = Connection::open(paths::db_path()?).context("failed to open cx sqlite registry")?;
@@ -155,6 +163,17 @@ pub fn init(conn: &Connection) -> Result<()> {
 
         create index if not exists idx_codex_sessions_modified
           on codex_sessions(modified_nanos);
+
+        create table if not exists limit_snapshots (
+          home_path text primary key,
+          observed_at text not null,
+          source_path text not null,
+          snapshot_json text not null,
+          indexed_at text not null
+        );
+
+        create index if not exists idx_limit_snapshots_observed
+          on limit_snapshots(observed_at);
         "#,
     )?;
     Ok(())
@@ -524,6 +543,67 @@ pub fn delete_indexed_codex_session(conn: &Connection, path: &Path) -> Result<()
     conn.execute(
         "delete from codex_sessions where path = ?1",
         params![path.to_string_lossy().to_string()],
+    )?;
+    Ok(())
+}
+
+pub fn get_cached_limit_snapshot(
+    conn: &Connection,
+    home_path: &Path,
+) -> Result<Option<CachedLimitSnapshot>> {
+    conn.query_row(
+        r#"
+        select home_path, observed_at, source_path, snapshot_json
+        from limit_snapshots
+        where home_path = ?1
+        "#,
+        params![home_path.to_string_lossy().to_string()],
+        |row| {
+            Ok(CachedLimitSnapshot {
+                home_path: PathBuf::from(row.get::<_, String>(0)?),
+                observed_at: row.get(1)?,
+                source_path: PathBuf::from(row.get::<_, String>(2)?),
+                snapshot_json: row.get(3)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+pub fn upsert_cached_limit_snapshot(
+    conn: &Connection,
+    home_path: &Path,
+    observed_at: &str,
+    source_path: &Path,
+    snapshot_json: &str,
+) -> Result<()> {
+    conn.execute(
+        r#"
+        insert into limit_snapshots (
+          home_path, observed_at, source_path, snapshot_json, indexed_at
+        ) values (?1, ?2, ?3, ?4, ?5)
+        on conflict(home_path) do update set
+          observed_at = excluded.observed_at,
+          source_path = excluded.source_path,
+          snapshot_json = excluded.snapshot_json,
+          indexed_at = excluded.indexed_at
+        "#,
+        params![
+            home_path.to_string_lossy().to_string(),
+            observed_at,
+            source_path.to_string_lossy().to_string(),
+            snapshot_json,
+            util::now(),
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn delete_cached_limit_snapshot(conn: &Connection, home_path: &Path) -> Result<()> {
+    conn.execute(
+        "delete from limit_snapshots where home_path = ?1",
+        params![home_path.to_string_lossy().to_string()],
     )?;
     Ok(())
 }

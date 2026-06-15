@@ -40,7 +40,7 @@ pub fn print_once(conn: &Connection) -> Result<()> {
         .into_iter()
         .map(|account| {
             let active = db::active_session_count(conn, &account.name)?;
-            let snapshot = limits::latest_snapshot(&account.codex_home)?;
+            let snapshot = limits::latest_snapshot_cached(conn, &account.codex_home)?;
             let status = if account.disabled {
                 "disabled".to_string()
             } else {

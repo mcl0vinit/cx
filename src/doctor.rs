@@ -129,7 +129,7 @@ fn check_accounts(conn: &Connection, cfg: &config::Config, report: &mut Report) 
             continue;
         }
 
-        let snapshot = limits::latest_snapshot(&account.codex_home)?;
+        let snapshot = limits::latest_snapshot_cached(conn, &account.codex_home)?;
         if limits::is_stale(snapshot.as_ref(), cfg.limit_snapshot_max_age_minutes()) {
             report.warn_with_hint(
                 &label,

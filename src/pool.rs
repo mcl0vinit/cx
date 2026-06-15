@@ -56,7 +56,7 @@ pub fn list(conn: &Connection) -> Result<()> {
         for (index, account_name) in accounts.iter().enumerate() {
             match db::get_account(conn, account_name)? {
                 Some(account) => {
-                    let snapshot = limits::latest_snapshot(&account.codex_home)?;
+                    let snapshot = limits::latest_snapshot_cached(conn, &account.codex_home)?;
                     let five = snapshot
                         .as_ref()
                         .and_then(|snapshot| snapshot.primary.as_ref());
@@ -250,7 +250,7 @@ fn choose_limit_aware(
             continue;
         }
         let active = db::active_session_count(conn, &account.name)?;
-        let snapshot = limits::latest_snapshot(&account.codex_home)?;
+        let snapshot = limits::latest_snapshot_cached(conn, &account.codex_home)?;
         if snapshot
             .as_ref()
             .map(|snapshot| {

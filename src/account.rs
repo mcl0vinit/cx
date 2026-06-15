@@ -4,6 +4,7 @@ use rusqlite::Connection;
 use serde_json::Value;
 use std::{
     fs,
+    io::IsTerminal,
     path::{Path, PathBuf},
     process::Stdio,
 };
@@ -234,7 +235,7 @@ pub fn status(conn: &Connection, name: &str, online: bool) -> Result<()> {
 
     let account =
         db::get_account(conn, name)?.ok_or_else(|| anyhow!("unknown account `{}`", name))?;
-    match limits::latest_snapshot(&account.codex_home)? {
+    match limits::latest_snapshot_cached(conn, &account.codex_home)? {
         Some(snapshot) => limits::print_snapshot(&snapshot),
         None => {
             println!("Limits");
@@ -271,7 +272,7 @@ fn status_row(conn: &Connection, name: &str, online: bool) -> Result<AccountStat
         db::get_account(conn, name)?.ok_or_else(|| anyhow!("unknown account `{}`", name))?;
     let managed_sessions = db::active_session_count(conn, &account.name)?;
     let codex_sessions = resume::codex_session_count(conn, &account.name, &account.codex_home)?;
-    let snapshot = limits::latest_snapshot(&account.codex_home)?;
+    let snapshot = limits::latest_snapshot_cached(conn, &account.codex_home)?;
     let status = if account.disabled {
         "disabled".to_string()
     } else {
@@ -484,17 +485,31 @@ pub fn online_check(conn: &Connection, name: &str) -> Result<String> {
     };
 
     db::set_account_status(conn, name, status, error.as_deref())?;
+    if let Err(error) = limits::refresh_snapshot_cache(conn, &account.codex_home) {
+        tracing::debug!(
+            account = name,
+            error = %error,
+            "failed to update limit snapshot cache after online check"
+        );
+    }
     Ok(status.to_string())
 }
 
 pub fn refresh(conn: &Connection, names: &[String], stale_only: bool) -> Result<()> {
-    let rows = names
-        .iter()
-        .map(|name| {
-            let outcome = refresh_one(conn, name, stale_only)?;
-            Ok(vec![name.clone(), outcome])
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let show_progress = names.len() > 1 && std::io::stderr().is_terminal();
+    if show_progress {
+        eprintln!("Refreshing {} accounts...", names.len());
+    }
+
+    let mut rows = Vec::new();
+    for name in names {
+        if show_progress {
+            eprintln!("  {name}");
+        }
+        let outcome = refresh_one(conn, name, stale_only)?;
+        rows.push(vec![name.clone(), outcome]);
+    }
+
     println!("{}", ui::heading("Refresh"));
     ui::print_table(&["ACCOUNT", "RESULT"], &rows, &[]);
     Ok(())
@@ -505,7 +520,7 @@ pub fn refresh_one(conn: &Connection, name: &str, stale_only: bool) -> Result<St
         db::get_account(conn, name)?.ok_or_else(|| anyhow!("unknown account `{}`", name))?;
     if stale_only {
         let cfg = config::load()?;
-        let snapshot = limits::latest_snapshot(&account.codex_home)?;
+        let snapshot = limits::latest_snapshot_cached(conn, &account.codex_home)?;
         if !limits::is_stale(snapshot.as_ref(), cfg.limit_snapshot_max_age_minutes()) {
             return Ok("fresh".to_string());
         }

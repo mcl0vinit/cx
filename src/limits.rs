@@ -1,14 +1,20 @@
-use crate::util;
-use anyhow::Result;
+use crate::{db, util};
+use anyhow::{Context, Result};
 use chrono::{DateTime, Local, Utc};
+use rusqlite::Connection;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
+    cmp::Reverse,
     fs,
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
+    time::SystemTime,
 };
 
-#[derive(Debug, Clone)]
+const RECENT_LIMIT_SCAN_FILES: usize = 64;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LimitSnapshot {
     pub observed_at: DateTime<Utc>,
     pub source: PathBuf,
@@ -20,21 +26,22 @@ pub struct LimitSnapshot {
     pub credits: Option<Credits>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LimitWindow {
     pub used_percent: f64,
     pub window_minutes: Option<u64>,
     pub resets_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Credits {
     pub has_credits: Option<bool>,
     pub unlimited: Option<bool>,
     pub balance: Option<String>,
 }
 
-pub fn latest_snapshot(codex_home: &Path) -> Result<Option<LimitSnapshot>> {
+#[cfg(test)]
+fn latest_snapshot(codex_home: &Path) -> Result<Option<LimitSnapshot>> {
     let session_files = session_files(&codex_home.join("sessions"))?;
     let mut latest: Option<LimitSnapshot> = None;
 
@@ -54,8 +61,125 @@ pub fn latest_snapshot(codex_home: &Path) -> Result<Option<LimitSnapshot>> {
     Ok(latest)
 }
 
+pub fn latest_snapshot_cached(
+    conn: &Connection,
+    codex_home: &Path,
+) -> Result<Option<LimitSnapshot>> {
+    let home_path = cache_home_path(codex_home);
+    if let Some(cached) = db::get_cached_limit_snapshot(conn, &home_path)? {
+        if cached.source_path.exists() {
+            match serde_json::from_str::<LimitSnapshot>(&cached.snapshot_json) {
+                Ok(snapshot) => return Ok(Some(snapshot)),
+                Err(error) => {
+                    tracing::debug!(
+                        home = %cached.home_path.display(),
+                        observed_at = %cached.observed_at,
+                        error = %error,
+                        "discarding invalid cached limit snapshot"
+                    );
+                }
+            }
+        }
+        db::delete_cached_limit_snapshot(conn, &home_path)?;
+    }
+
+    refresh_snapshot_cache(conn, codex_home)
+}
+
+pub fn refresh_snapshot_cache(
+    conn: &Connection,
+    codex_home: &Path,
+) -> Result<Option<LimitSnapshot>> {
+    let snapshot = latest_snapshot_recent(codex_home, RECENT_LIMIT_SCAN_FILES)?;
+    if let Some(snapshot) = &snapshot {
+        write_snapshot_cache(conn, codex_home, snapshot)?;
+    }
+    Ok(snapshot)
+}
+
 pub fn remaining_percent(window: &LimitWindow) -> f64 {
     (100.0 - window.used_percent).max(0.0)
+}
+
+fn write_snapshot_cache(
+    conn: &Connection,
+    codex_home: &Path,
+    snapshot: &LimitSnapshot,
+) -> Result<()> {
+    let home_path = cache_home_path(codex_home);
+    let snapshot_json = serde_json::to_string(snapshot).context("failed to serialize limits")?;
+    db::upsert_cached_limit_snapshot(
+        conn,
+        &home_path,
+        &snapshot.observed_at.to_rfc3339(),
+        &snapshot.source,
+        &snapshot_json,
+    )
+}
+
+fn latest_snapshot_recent(codex_home: &Path, limit: usize) -> Result<Option<LimitSnapshot>> {
+    let session_files = recent_session_files(&codex_home.join("sessions"), limit)?;
+    latest_snapshot_in_files(session_files)
+}
+
+fn latest_snapshot_in_files(session_files: Vec<PathBuf>) -> Result<Option<LimitSnapshot>> {
+    let mut latest: Option<LimitSnapshot> = None;
+    for file in session_files {
+        let fallback_time = file_modified_at(&file);
+        for snapshot in snapshots_in_file(&file, fallback_time)? {
+            if latest
+                .as_ref()
+                .map(|current| snapshot.observed_at > current.observed_at)
+                .unwrap_or(true)
+            {
+                latest = Some(snapshot);
+            }
+        }
+    }
+    Ok(latest)
+}
+
+fn recent_session_files(root: &Path, limit: usize) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    collect_session_files_with_modified(root, &mut files)?;
+    files.sort_by_key(|(modified, _)| Reverse(*modified));
+    Ok(files
+        .into_iter()
+        .take(limit)
+        .map(|(_, path)| path)
+        .collect())
+}
+
+fn collect_session_files_with_modified(
+    dir: &Path,
+    files: &mut Vec<(SystemTime, PathBuf)>,
+) -> Result<()> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Ok(());
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_session_files_with_modified(&path, files)?;
+            continue;
+        }
+
+        if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+            continue;
+        }
+
+        let modified = fs::metadata(&path)
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        files.push((modified, path));
+    }
+
+    Ok(())
+}
+
+fn cache_home_path(codex_home: &Path) -> PathBuf {
+    fs::canonicalize(codex_home).unwrap_or_else(|_| codex_home.to_path_buf())
 }
 
 pub fn is_exhausted(window: &LimitWindow) -> bool {
@@ -250,12 +374,14 @@ fn file_modified_at(path: &Path) -> DateTime<Utc> {
         .unwrap_or_else(|_| Utc::now())
 }
 
+#[cfg(test)]
 fn session_files(root: &Path) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     collect_session_files(root, &mut files)?;
     Ok(files)
 }
 
+#[cfg(test)]
 fn collect_session_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
     let Ok(entries) = fs::read_dir(dir) else {
         return Ok(());
@@ -343,6 +469,7 @@ fn compact_duration(seconds: i64, zero: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::Connection;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_root(name: &str) -> PathBuf {
@@ -379,6 +506,43 @@ mod tests {
         assert_eq!(snapshot.primary.unwrap().used_percent, 40.0);
         assert_eq!(snapshot.secondary.unwrap().used_percent, 50.0);
         assert_eq!(snapshot.credits.unwrap().balance.as_deref(), Some("11.25"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cached_snapshot_avoids_rescanning_until_refresh() {
+        let root = temp_root("limit-cache");
+        let file = root
+            .join("sessions")
+            .join("2026")
+            .join("06")
+            .join("15")
+            .join("rollout.jsonl");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(
+            &file,
+            r#"{"timestamp":"2026-06-15T12:00:00Z","type":"event_msg","payload":{"type":"token_count","rate_limits":{"limit_id":"codex","primary":{"used_percent":10.0,"window_minutes":300,"resets_at":1781528400}}}}"#,
+        )
+        .unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        db::init(&conn).unwrap();
+
+        let cached = latest_snapshot_cached(&conn, &root).unwrap().unwrap();
+        assert_eq!(cached.primary.unwrap().used_percent, 10.0);
+
+        fs::write(
+            &file,
+            r#"{"timestamp":"2026-06-15T12:05:00Z","type":"event_msg","payload":{"type":"token_count","rate_limits":{"limit_id":"codex","primary":{"used_percent":80.0,"window_minutes":300,"resets_at":1781528400}}}}"#,
+        )
+        .unwrap();
+
+        let cached = latest_snapshot_cached(&conn, &root).unwrap().unwrap();
+        assert_eq!(cached.primary.unwrap().used_percent, 10.0);
+
+        let refreshed = refresh_snapshot_cache(&conn, &root).unwrap().unwrap();
+        assert_eq!(refreshed.primary.unwrap().used_percent, 80.0);
 
         let _ = fs::remove_dir_all(root);
     }

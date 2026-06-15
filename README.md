@@ -171,6 +171,8 @@ Codex writes `rate_limits` snapshots into session JSONL files. `cx` reads the la
 - observed snapshot age
 - account health and active managed sessions
 
+`cx` caches the latest limit snapshot for each Codex home in `~/.cx/cx.sqlite`. On a cache miss it samples recent session files instead of parsing the full history tree. Online refreshes update the cache after Codex writes a new snapshot.
+
 Local read:
 
 ```bash
