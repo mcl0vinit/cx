@@ -607,6 +607,11 @@ pub fn delete_indexed_codex_sessions_for_home(conn: &Connection, home_path: &Pat
     Ok(())
 }
 
+pub fn clear_indexed_codex_sessions(conn: &Connection) -> Result<()> {
+    conn.execute("delete from codex_sessions", [])?;
+    Ok(())
+}
+
 pub fn get_cached_limit_snapshot(
     conn: &Connection,
     home_path: &Path,
@@ -665,6 +670,11 @@ pub fn delete_cached_limit_snapshot(conn: &Connection, home_path: &Path) -> Resu
         "delete from limit_snapshots where home_path = ?1",
         params![home_path.to_string_lossy().to_string()],
     )?;
+    Ok(())
+}
+
+pub fn clear_cached_limit_snapshots(conn: &Connection) -> Result<()> {
+    conn.execute("delete from limit_snapshots", [])?;
     Ok(())
 }
 

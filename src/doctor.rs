@@ -1,9 +1,19 @@
-use crate::{codex, config, daemon, db, limits, paths, ui, util};
+use crate::{codex, config, daemon, db, limits, maintenance, paths, ui, util};
 use anyhow::Result;
 use rusqlite::Connection;
-use std::{path::Path, process::Command};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
-pub fn run(conn: &Connection) -> Result<()> {
+pub fn run(conn: &Connection, fix: bool) -> Result<()> {
+    if fix {
+        let fixes = apply_fixes(conn)?;
+        print_fixes(&fixes);
+        println!();
+    }
+
     let mut report = Report::default();
     let cfg = match config::load() {
         Ok(cfg) => {
@@ -26,6 +36,87 @@ pub fn run(conn: &Connection) -> Result<()> {
 
     report.finish();
     Ok(())
+}
+
+fn apply_fixes(conn: &Connection) -> Result<Vec<FixEntry>> {
+    Ok(vec![
+        ensure_default_config()?,
+        ensure_gitignore()?,
+        clean_stale_pidfile()?,
+        sync_indexes(conn)?,
+    ])
+}
+
+fn ensure_default_config() -> Result<FixEntry> {
+    paths::ensure_root_dirs()?;
+    let path = paths::config_path()?;
+    if path.exists() {
+        return Ok(FixEntry::skipped("config", "already exists"));
+    }
+
+    fs::write(&path, config::DEFAULT_CONFIG)?;
+    Ok(FixEntry::applied(
+        "config",
+        &format!("created {}", util::display_path(&path)),
+    ))
+}
+
+fn ensure_gitignore() -> Result<FixEntry> {
+    if !Path::new(".git").exists() {
+        return Ok(FixEntry::skipped("gitignore", "not a git repo"));
+    }
+
+    let path = PathBuf::from(".gitignore");
+    let existing = fs::read_to_string(&path).unwrap_or_default();
+    let missing = ["docs/", "/target", "*.sqlite"]
+        .into_iter()
+        .filter(|pattern| !existing.lines().any(|line| line.trim() == *pattern))
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return Ok(FixEntry::skipped(
+            "gitignore",
+            "already includes local artifacts",
+        ));
+    }
+
+    let mut updated = existing;
+    if !updated.is_empty() && !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    for pattern in &missing {
+        updated.push_str(pattern);
+        updated.push('\n');
+    }
+    fs::write(&path, updated)?;
+    Ok(FixEntry::applied(
+        "gitignore",
+        &format!("added {}", missing.join(", ")),
+    ))
+}
+
+fn clean_stale_pidfile() -> Result<FixEntry> {
+    if daemon::clean_stale_pidfile()? {
+        Ok(FixEntry::applied("daemon", "removed stale pidfile"))
+    } else {
+        Ok(FixEntry::skipped("daemon", "pidfile absent or active"))
+    }
+}
+
+fn sync_indexes(conn: &Connection) -> Result<FixEntry> {
+    let results = maintenance::sync_indexes(
+        conn,
+        maintenance::IndexOptions {
+            sessions: true,
+            limits: true,
+            rebuild: false,
+        },
+    )?;
+    let detail = results
+        .into_iter()
+        .map(|result| format!("{} {}", result.count, result.component))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Ok(FixEntry::applied("indexes", &detail))
 }
 
 fn check_paths(report: &mut Report) -> Result<()> {
@@ -215,6 +306,39 @@ fn check_git_hygiene(report: &mut Report) {
             "remove these before publishing",
         );
     }
+}
+
+struct FixEntry {
+    action: String,
+    target: String,
+    detail: String,
+}
+
+impl FixEntry {
+    fn applied(target: &str, detail: &str) -> Self {
+        Self {
+            action: "fixed".to_string(),
+            target: target.to_string(),
+            detail: detail.to_string(),
+        }
+    }
+
+    fn skipped(target: &str, detail: &str) -> Self {
+        Self {
+            action: "skipped".to_string(),
+            target: target.to_string(),
+            detail: detail.to_string(),
+        }
+    }
+}
+
+fn print_fixes(fixes: &[FixEntry]) {
+    println!("{}", ui::heading("Fixes"));
+    let rows = fixes
+        .iter()
+        .map(|fix| vec![fix.action.clone(), fix.target.clone(), fix.detail.clone()])
+        .collect::<Vec<_>>();
+    ui::print_table(&["ACTION", "TARGET", "DETAIL"], &rows, &[]);
 }
 
 #[derive(Default)]

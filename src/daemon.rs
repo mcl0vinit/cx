@@ -181,6 +181,27 @@ pub fn running_pid() -> Result<Option<u32>> {
     }
 }
 
+pub fn clean_stale_pidfile() -> Result<bool> {
+    let path = paths::pid_path()?;
+    if !path.exists() {
+        return Ok(false);
+    }
+
+    let pid = match read_pid() {
+        Ok(pid) => pid,
+        Err(_) => {
+            fs::remove_file(path)?;
+            return Ok(true);
+        }
+    };
+    if is_cxd_process(pid)? {
+        return Ok(false);
+    }
+
+    fs::remove_file(path)?;
+    Ok(true)
+}
+
 fn is_running() -> Result<bool> {
     let pid = match read_pid() {
         Ok(pid) => pid,

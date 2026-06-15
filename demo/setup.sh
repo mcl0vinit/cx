@@ -31,6 +31,7 @@ ln -sfn "$demo_root" "$display_root"
 
 mkdir -p "$bin_dir" "$demo_home"
 mkdir -p "$display_root/repo"
+git -C "$display_root/repo" init -q
 ln -sf "$cx_bin" "$bin_dir/cx"
 
 cat >"$fake_codex" <<'FAKE_CODEX'

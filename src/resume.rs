@@ -18,6 +18,30 @@ pub struct ResolvedInvocation {
     pub home: PathBuf,
     pub args: Vec<String>,
     pub cwd: Option<PathBuf>,
+    pub summary: Option<ResumeSummary>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResumeSummary {
+    pub repo: Option<PathBuf>,
+    pub session_id: String,
+    pub source: String,
+    pub target: String,
+    pub action: String,
+}
+
+#[derive(Debug, Clone)]
+struct ResumeSummaryDraft {
+    repo: Option<PathBuf>,
+    source: String,
+    target: String,
+    action: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionIndexReport {
+    pub homes: usize,
+    pub sessions: usize,
 }
 
 #[derive(Debug)]
@@ -98,6 +122,12 @@ pub fn resolve_invocation(
         args,
         &request,
         &session,
+        Some(ResumeSummaryDraft {
+            repo: None,
+            source: session.home.label.clone(),
+            target: session.home.label.clone(),
+            action: "reused".to_string(),
+        }),
     )?))
 }
 
@@ -127,6 +157,12 @@ pub fn resolve_account_invocation(
             args,
             &request,
             &session,
+            Some(ResumeSummaryDraft {
+                repo: session_file_cwd(&session)?,
+                source: selected_home.label.clone(),
+                target: selected_home.label.clone(),
+                action: "reused".to_string(),
+            }),
         )?));
     }
 
@@ -144,12 +180,28 @@ pub fn resolve_account_invocation(
         }
     };
 
+    let source_label = source.home.label.clone();
+    let source_cwd = session_file_cwd(&source)?;
     let adopted = adopt_session_file(conn, account_name, &selected_home, source)?;
+    let action = if adopted.already_adopted {
+        "already adopted"
+    } else {
+        "adopted"
+    }
+    .to_string();
+    let target_session =
+        SessionFile::from_adopted_target(selected_home.clone(), adopted.target.clone());
     Ok(Some(resolved_invocation(
         selected_home.path.clone(),
         args,
         &request,
-        &SessionFile::from_adopted_target(selected_home, adopted.target),
+        &target_session,
+        Some(ResumeSummaryDraft {
+            repo: source_cwd,
+            source: source_label,
+            target: selected_home.label,
+            action,
+        }),
     )?))
 }
 
@@ -217,16 +269,48 @@ fn resolve_here_in_root(
             label: account_name.to_string(),
             path: account_home.to_path_buf(),
         };
-        let session = if same_path(&source.home.path, account_home) {
-            source
+        let source_label = source.home.label.clone();
+        let (session, action) = if same_path(&source.home.path, account_home) {
+            (source, "reused".to_string())
         } else {
             let adopted = adopt_session_file(conn, account_name, &selected_home, source)?;
-            SessionFile::from_adopted_target(selected_home.clone(), adopted.target)
+            let action = if adopted.already_adopted {
+                "already adopted"
+            } else {
+                "adopted"
+            }
+            .to_string();
+            (
+                SessionFile::from_adopted_target(selected_home.clone(), adopted.target),
+                action,
+            )
         };
-        return resolved_invocation(selected_home.path, &args, &request, &session);
+        return resolved_invocation(
+            selected_home.path,
+            &args,
+            &request,
+            &session,
+            Some(ResumeSummaryDraft {
+                repo: Some(repo_root.to_path_buf()),
+                source: source_label,
+                target: selected_home.label,
+                action,
+            }),
+        );
     }
 
-    resolved_invocation(source.home.path.clone(), &args, &request, &source)
+    resolved_invocation(
+        source.home.path.clone(),
+        &args,
+        &request,
+        &source,
+        Some(ResumeSummaryDraft {
+            repo: Some(repo_root.to_path_buf()),
+            source: source.home.label.clone(),
+            target: source.home.label.clone(),
+            action: "reused".to_string(),
+        }),
+    )
 }
 
 fn adopt_session_file(
@@ -343,6 +427,20 @@ pub fn codex_session_count(conn: &Connection, label: &str, home: &Path) -> Resul
     db::count_indexed_codex_sessions_for_home(conn, &index_home_path(&home))
 }
 
+pub fn sync_all_session_indexes(conn: &Connection, rebuild: bool) -> Result<SessionIndexReport> {
+    let homes = session_homes(conn, None)?;
+    if rebuild {
+        db::clear_indexed_codex_sessions(conn)?;
+    }
+    sync_session_index(conn, &homes)?;
+    let home_paths = homes.iter().map(index_home_path).collect::<Vec<_>>();
+    let sessions = db::list_indexed_codex_sessions_for_homes(conn, &home_paths)?.len();
+    Ok(SessionIndexReport {
+        homes: homes.len(),
+        sessions,
+    })
+}
+
 fn parse_resume_request(args: &[String]) -> Option<ResumeRequest> {
     if args.first().map(|arg| arg.as_str()) != Some("resume") {
         return None;
@@ -371,6 +469,7 @@ fn resolved_invocation(
     args: &[String],
     request: &ResumeRequest,
     session: &SessionFile,
+    summary: Option<ResumeSummaryDraft>,
 ) -> Result<ResolvedInvocation> {
     let id = session_file_id(session)?
         .ok_or_else(|| anyhow!("could not read session id from {}", session.path.display()))?;
@@ -379,6 +478,13 @@ fn resolved_invocation(
         home,
         args: rewrite_resume_args(args, request, &id),
         cwd: session_file_cwd(session)?,
+        summary: summary.map(|summary| ResumeSummary {
+            repo: summary.repo,
+            session_id: id,
+            source: summary.source,
+            target: summary.target,
+            action: summary.action,
+        }),
     })
 }
 
@@ -686,7 +792,11 @@ fn repo_root_for(cwd: &Path) -> Result<PathBuf> {
             let text = String::from_utf8_lossy(&output.stdout);
             let root = text.trim();
             if !root.is_empty() {
-                return Ok(normalize_path(Path::new(root)));
+                let root_path = Path::new(root);
+                if normalize_path(root_path) == normalize_path(cwd) {
+                    return Ok(cwd.to_path_buf());
+                }
+                return Ok(normalize_path(root_path));
             }
         }
     }

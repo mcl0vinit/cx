@@ -97,6 +97,7 @@ cx personal resume <session-id>
 # See account email, limits, and health
 cx status
 cx watch --once
+cx explain
 cx refresh --stale
 cx account status
 cx account status personal
@@ -104,6 +105,7 @@ cx account status personal --online
 
 # Check local setup
 cx doctor
+cx doctor --fix
 
 # Generate shell completions
 cx completion zsh > ~/.zfunc/_cx
@@ -211,6 +213,13 @@ cx refresh --all --stale
 
 It skips accounts whose latest local snapshot shows an unexpired exhausted 5h or weekly limit. Accounts without snapshots are still usable, but score as unknown rather than best.
 
+Explain the next smart pick without launching Codex:
+
+```bash
+cx explain
+cx explain --pool coding
+```
+
 Pool strategies:
 
 ```text
@@ -235,6 +244,14 @@ cx resume --last
 ```
 
 `cx` keeps a local SQLite index of discovered Codex session ids and repo cwd metadata. The first scan of a large `~/.codex/sessions` tree may take a moment; later resume and repo-aware lookups reuse the index and only parse new or changed session files.
+
+Refresh or rebuild local indexes explicitly:
+
+```bash
+cx index
+cx index --sessions --rebuild
+cx index --limits
+```
 
 Account-scoped resume copies the session into that account home first when needed:
 
@@ -349,6 +366,7 @@ Run:
 
 ```bash
 cx doctor
+cx doctor --fix
 ```
 
 It checks:
@@ -362,6 +380,8 @@ It checks:
 - tmux availability
 - daemon pidfile/process status
 - common git hygiene for ignored local files
+
+`cx doctor --fix` creates a missing default config, adds common local artifacts to `.gitignore`, removes a stale daemon pidfile, and syncs local indexes.
 
 ## Command Reference
 
@@ -393,6 +413,7 @@ cx tmux migrate NAME [--account NAME | --pool NAME]
 cx run --account NAME -- ARGS...
 cx run --pool NAME -- ARGS...
 cx smart [--pool NAME] [--refresh] -- ARGS...
+cx explain [--pool NAME]
 
 cx sessions [--limit N]
 cx resume <session-id>
@@ -400,10 +421,11 @@ cx resume --last
 cx resume-here [--account NAME | --pool NAME | --smart]
 cx NAME resume <session-id>
 cx NAME resume-here
+cx index [--sessions] [--limits] [--rebuild]
 
 cx refresh [NAME] [--all | --pool NAME] [--stale]
 cx watch [--once] [--interval-secs N]
-cx doctor
+cx doctor [--fix]
 cx status
 ```
 

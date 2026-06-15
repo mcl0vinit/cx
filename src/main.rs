@@ -6,6 +6,7 @@ mod dashboard;
 mod db;
 mod doctor;
 mod limits;
+mod maintenance;
 mod migrate;
 mod paths;
 mod pool;
@@ -18,7 +19,7 @@ use anyhow::{anyhow, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
 use rusqlite::Connection;
-use std::{path::PathBuf, process::Stdio};
+use std::{fs, path::PathBuf, process::Stdio};
 
 #[derive(Parser, Debug)]
 #[command(name = "cx")]
@@ -161,8 +162,29 @@ enum Commands {
         #[arg(long, help = "Print one dashboard frame and exit.")]
         once: bool,
     },
+    #[command(about = "Explain limit-aware account selection")]
+    Explain {
+        #[arg(
+            short,
+            long,
+            help = "Pool to explain; defaults to configured pool or all accounts"
+        )]
+        pool: Option<String>,
+    },
+    #[command(about = "Maintain local session and limit indexes")]
+    Index {
+        #[arg(long, help = "Sync Codex session index")]
+        sessions: bool,
+        #[arg(long, help = "Sync cached limit snapshots")]
+        limits: bool,
+        #[arg(long, help = "Clear selected indexes before syncing")]
+        rebuild: bool,
+    },
     #[command(about = "Run diagnostics for local cx setup")]
-    Doctor,
+    Doctor {
+        #[arg(long, help = "Apply safe local repairs before reporting diagnostics")]
+        fix: bool,
+    },
     #[command(about = "Show account and managed-session overview")]
     Status,
     #[command(about = "Manage the background cx daemon")]
@@ -381,7 +403,13 @@ fn main() -> Result<()> {
             interval_secs,
             once,
         }) => dashboard::watch(&conn, interval_secs, once),
-        Some(Commands::Doctor) => doctor::run(&conn),
+        Some(Commands::Explain { pool }) => pool::explain(&conn, pool.as_deref()),
+        Some(Commands::Index {
+            sessions,
+            limits,
+            rebuild,
+        }) => handle_index(&conn, sessions, limits, rebuild),
+        Some(Commands::Doctor { fix }) => doctor::run(&conn, fix),
         Some(Commands::Status) => handle_status(&conn),
         Some(Commands::Daemon { command }) => handle_daemon(command),
         None => {
@@ -461,7 +489,7 @@ fn handle_run(
     if let Some(resolved) =
         resume::resolve_account_invocation(conn, &chosen.name, &chosen.codex_home, &args)?
     {
-        return run_codex_direct(&resolved.home, cwd.or(resolved.cwd), &resolved.args);
+        return run_resolved_codex(resolved, cwd);
     }
     run_codex_direct(&chosen.codex_home, cwd, &args)
 }
@@ -482,7 +510,7 @@ fn handle_smart(
     if let Some(resolved) =
         resume::resolve_account_invocation(conn, &chosen.name, &chosen.codex_home, &args)?
     {
-        return run_codex_direct(&resolved.home, cwd.or(resolved.cwd), &resolved.args);
+        return run_resolved_codex(resolved, cwd);
     }
     run_codex_direct(&chosen.codex_home, cwd, &args)
 }
@@ -503,6 +531,19 @@ fn handle_refresh(
     stale_only: bool,
 ) -> Result<()> {
     refresh_targets(conn, name, all, pool_name, stale_only)
+}
+
+fn handle_index(conn: &Connection, sessions: bool, limits: bool, rebuild: bool) -> Result<()> {
+    let results = maintenance::sync_indexes(
+        conn,
+        maintenance::IndexOptions {
+            sessions,
+            limits,
+            rebuild,
+        },
+    )?;
+    maintenance::print_index_results(&results);
+    Ok(())
 }
 
 fn refresh_targets(
@@ -577,7 +618,7 @@ fn handle_resume(conn: &Connection, args: Vec<String>) -> Result<()> {
     let mut codex_args = vec!["resume".to_string()];
     codex_args.extend(util::normalize_passthrough(args));
     if let Some(resolved) = resume::resolve_invocation(conn, None, &codex_args)? {
-        return run_codex_direct(&resolved.home, resolved.cwd, &resolved.args);
+        return run_resolved_codex(resolved, None);
     }
     let codex_home = resume::default_resume_home(conn, None)?;
     run_codex_direct(&codex_home, None, &codex_args)
@@ -604,10 +645,10 @@ fn handle_resume_here(
     let target = selected
         .as_ref()
         .map(|account| (account.name.as_str(), account.codex_home.as_path()));
-    let cwd = std::env::current_dir()?;
+    let cwd = logical_current_dir()?;
     let args = util::normalize_passthrough(args);
     let resolved = resume::resolve_here_invocation(conn, target, &cwd, &args)?;
-    run_codex_direct(&resolved.home, resolved.cwd, &resolved.args)
+    run_resolved_codex(resolved, None)
 }
 
 fn handle_tmux(conn: &Connection, command: TmuxCommand) -> Result<()> {
@@ -703,6 +744,24 @@ fn handle_daemon(command: DaemonCommand) -> Result<()> {
     }
 }
 
+fn logical_current_dir() -> Result<PathBuf> {
+    let current = std::env::current_dir()?;
+    let Some(pwd) = std::env::var_os("PWD").map(PathBuf::from) else {
+        return Ok(current);
+    };
+    if !pwd.is_absolute() {
+        return Ok(current);
+    }
+
+    let current_real = fs::canonicalize(&current).ok();
+    let pwd_real = fs::canonicalize(&pwd).ok();
+    if current_real.is_some() && current_real == pwd_real {
+        Ok(pwd)
+    } else {
+        Ok(current)
+    }
+}
+
 fn is_reserved_command(name: &str) -> bool {
     matches!(
         name,
@@ -721,6 +780,8 @@ fn is_reserved_command(name: &str) -> bool {
             | "sessions"
             | "refresh"
             | "watch"
+            | "explain"
+            | "index"
             | "doctor"
             | "status"
             | "daemon"
@@ -762,9 +823,35 @@ fn run_account_shorthand(conn: &Connection, account_name: &str, rest: &[String])
     if let Some(resolved) =
         resume::resolve_account_invocation(conn, &account.name, &account.codex_home, &args)?
     {
-        return run_codex_direct(&resolved.home, resolved.cwd, &resolved.args);
+        return run_resolved_codex(resolved, None);
     }
     run_codex_direct(&account.codex_home, None, &args)
+}
+
+fn run_resolved_codex(
+    resolved: resume::ResolvedInvocation,
+    cwd_override: Option<PathBuf>,
+) -> Result<()> {
+    print_resume_summary(resolved.summary.as_ref());
+    run_codex_direct(
+        &resolved.home,
+        cwd_override.or(resolved.cwd),
+        &resolved.args,
+    )
+}
+
+fn print_resume_summary(summary: Option<&resume::ResumeSummary>) {
+    let Some(summary) = summary else {
+        return;
+    };
+
+    eprintln!(
+        "cx resume: session={} source={} target={} action={}",
+        summary.session_id, summary.source, summary.target, summary.action
+    );
+    if let Some(repo) = &summary.repo {
+        eprintln!("repo: {}", util::display_path(repo));
+    }
 }
 
 fn run_codex_direct(

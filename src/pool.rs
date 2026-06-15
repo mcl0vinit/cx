@@ -155,6 +155,68 @@ pub fn choose_smart(
     )
 }
 
+pub fn explain(conn: &Connection, pool_name: Option<&str>) -> Result<()> {
+    let configured_pool = configured_pool_name(pool_name)?;
+    let (scope, entries) = explain_entries(conn, configured_pool.as_deref())?;
+    let selected = entries
+        .iter()
+        .filter_map(|entry| {
+            entry
+                .score
+                .as_ref()
+                .map(|score| (score.clone(), entry.account.clone()))
+        })
+        .min_by_key(|(score, _)| score.clone())
+        .map(|(_, account)| account);
+
+    println!("{}", ui::heading("Routing Explain"));
+    println!("{:<10} {}", "Scope", scope);
+    println!("{:<10} limit-aware", "Strategy");
+    println!();
+
+    if entries.is_empty() {
+        println!("No accounts found.");
+        return Ok(());
+    }
+
+    let rows = entries
+        .into_iter()
+        .map(|entry| {
+            let selected = selected.as_deref() == Some(entry.account.as_str());
+            let decision = if selected {
+                "selected".to_string()
+            } else if entry.score.is_some() {
+                "eligible".to_string()
+            } else {
+                "skipped".to_string()
+            };
+            let reason = if selected {
+                "best 5h/wk/session score".to_string()
+            } else {
+                entry.reason
+            };
+            vec![
+                entry.account,
+                entry.status,
+                entry.five_left,
+                entry.weekly_left,
+                entry.active,
+                decision,
+                reason,
+                entry.home,
+            ]
+        })
+        .collect::<Vec<_>>();
+    ui::print_table(
+        &[
+            "ACCOUNT", "STATUS", "5H LEFT", "WK LEFT", "ACTIVE", "DECISION", "REASON", "HOME",
+        ],
+        &rows,
+        &[4],
+    );
+    Ok(())
+}
+
 pub fn default_strategy() -> Result<String> {
     Ok(config::load()?
         .default_strategy
@@ -290,6 +352,130 @@ fn choose_limit_aware(
     candidates
         .sort_by_key(|(five, weekly, active, name, _)| (*five, *weekly, *active, name.clone()));
     Ok(candidates.remove(0).4)
+}
+
+#[derive(Debug, Clone, Eq, Ord, PartialEq, PartialOrd)]
+struct ExplainScore {
+    five: u32,
+    weekly: u32,
+    active: i64,
+    account: String,
+}
+
+#[derive(Debug, Clone)]
+struct ExplainEntry {
+    account: String,
+    status: String,
+    five_left: String,
+    weekly_left: String,
+    active: String,
+    reason: String,
+    home: String,
+    score: Option<ExplainScore>,
+}
+
+fn explain_entries(
+    conn: &Connection,
+    configured_pool: Option<&str>,
+) -> Result<(String, Vec<ExplainEntry>)> {
+    match configured_pool {
+        Some(pool_name) => {
+            db::get_pool(conn, pool_name)?
+                .ok_or_else(|| anyhow!("unknown pool `{}`", pool_name))?;
+            let mut entries = Vec::new();
+            for account_name in db::get_pool_accounts(conn, pool_name)? {
+                entries.push(explain_account(conn, &account_name)?);
+            }
+            Ok((format!("pool `{pool_name}`"), entries))
+        }
+        None => {
+            let mut entries = Vec::new();
+            for account in db::list_accounts(conn)? {
+                entries.push(explain_registered_account(conn, account)?);
+            }
+            Ok(("all accounts".to_string(), entries))
+        }
+    }
+}
+
+fn explain_account(conn: &Connection, account_name: &str) -> Result<ExplainEntry> {
+    match db::get_account(conn, account_name)? {
+        Some(account) => explain_registered_account(conn, account),
+        None => Ok(ExplainEntry {
+            account: account_name.to_string(),
+            status: "missing".to_string(),
+            five_left: "-".to_string(),
+            weekly_left: "-".to_string(),
+            active: "-".to_string(),
+            reason: "not registered".to_string(),
+            home: "-".to_string(),
+            score: None,
+        }),
+    }
+}
+
+fn explain_registered_account(conn: &Connection, account: Account) -> Result<ExplainEntry> {
+    let active = db::active_session_count(conn, &account.name)?;
+    let snapshot = limits::latest_snapshot_cached(conn, &account.codex_home)?;
+    let primary = snapshot
+        .as_ref()
+        .and_then(|snapshot| snapshot.primary.as_ref());
+    let secondary = snapshot
+        .as_ref()
+        .and_then(|snapshot| snapshot.secondary.as_ref());
+    let (eligible, reason) = explain_eligibility(&account, snapshot.as_ref());
+    let score = eligible.then(|| ExplainScore {
+        five: window_score(primary),
+        weekly: window_score(secondary),
+        active,
+        account: account.name.clone(),
+    });
+    let status = if account.disabled {
+        "disabled".to_string()
+    } else {
+        account.status.clone()
+    };
+
+    Ok(ExplainEntry {
+        account: account.name,
+        status,
+        five_left: limits::compact_remaining(primary),
+        weekly_left: limits::compact_remaining(secondary),
+        active: active.to_string(),
+        reason,
+        home: util::display_path(&account.codex_home),
+        score,
+    })
+}
+
+fn explain_eligibility(
+    account: &Account,
+    snapshot: Option<&limits::LimitSnapshot>,
+) -> (bool, String) {
+    if account.disabled {
+        return (false, "disabled".to_string());
+    }
+    if !is_eligible(account) {
+        return (false, format!("status {}", account.status));
+    }
+    if snapshot
+        .and_then(|snapshot| snapshot.primary.as_ref())
+        .map(limits::is_exhausted)
+        .unwrap_or(false)
+    {
+        return (false, "5h exhausted".to_string());
+    }
+    if snapshot
+        .and_then(|snapshot| snapshot.secondary.as_ref())
+        .map(limits::is_exhausted)
+        .unwrap_or(false)
+    {
+        return (false, "weekly exhausted".to_string());
+    }
+    if snapshot.is_none() {
+        return (true, "no limits snapshot".to_string());
+    }
+    (true, "eligible".to_string())
 }
 
 fn window_score(window: Option<&limits::LimitWindow>) -> u32 {
