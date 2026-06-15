@@ -201,6 +201,23 @@ pub fn status(conn: &Connection, name: &str, online: bool) -> Result<()> {
     Ok(())
 }
 
+pub fn status_all(conn: &Connection, online: bool) -> Result<()> {
+    let accounts = db::list_accounts(conn)?;
+    if accounts.is_empty() {
+        println!("No accounts registered.");
+        return Ok(());
+    }
+
+    for (index, account) in accounts.iter().enumerate() {
+        if index > 0 {
+            println!();
+        }
+        status(conn, &account.name, online)?;
+    }
+
+    Ok(())
+}
+
 pub fn local_check(conn: &Connection, name: &str) -> Result<String> {
     let account =
         db::get_account(conn, name)?.ok_or_else(|| anyhow!("unknown account `{}`", name))?;

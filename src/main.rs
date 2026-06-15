@@ -153,7 +153,7 @@ enum AccountCommand {
         online: bool,
     },
     Status {
-        name: String,
+        name: Option<String>,
         #[arg(
             long,
             help = "Refresh limits by running `codex exec` first. This may consume usage."
@@ -322,7 +322,10 @@ fn handle_account(conn: &Connection, command: AccountCommand) -> Result<()> {
                 Ok(())
             }
         }
-        AccountCommand::Status { name, online } => account::status(conn, &name, online),
+        AccountCommand::Status { name, online } => match name {
+            Some(name) => account::status(conn, &name, online),
+            None => account::status_all(conn, online),
+        },
         AccountCommand::Disable { name, reason } => {
             account::disable(conn, &name, reason.as_deref())
         }

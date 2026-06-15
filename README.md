@@ -97,6 +97,7 @@ cx personal resume <session-id>
 # See account limits and health
 cx watch --once
 cx refresh --stale
+cx account status
 cx account status personal
 cx account status personal --online
 
@@ -172,6 +173,7 @@ Codex writes `rate_limits` snapshots into session JSONL files. `cx` reads the la
 Local read:
 
 ```bash
+cx account status
 cx account status personal
 cx watch --once
 ```
@@ -362,7 +364,7 @@ cx account add NAME [--codex-home PATH]
 cx account login NAME
 cx account logout NAME
 cx account list
-cx account status NAME [--online]
+cx account status [NAME] [--online]
 cx account check NAME [--online]
 cx account check --all [--online]
 cx account disable NAME [--reason TEXT]
