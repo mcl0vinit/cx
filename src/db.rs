@@ -1,5 +1,5 @@
 use crate::{paths, util};
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -187,6 +187,58 @@ pub fn upsert_account(conn: &Connection, name: &str, codex_home: PathBuf) -> Res
         on conflict(name) do update set codex_home = excluded.codex_home
         "#,
         params![name, codex_home.to_string_lossy().to_string(), util::now()],
+    )?;
+    Ok(())
+}
+
+pub fn rename_account(
+    conn: &Connection,
+    old_name: &str,
+    new_name: &str,
+    new_codex_home: PathBuf,
+) -> Result<()> {
+    conn.execute_batch("begin immediate")?;
+    let result = rename_account_rows(conn, old_name, new_name, new_codex_home);
+    match result {
+        Ok(()) => {
+            conn.execute_batch("commit")?;
+            Ok(())
+        }
+        Err(error) => {
+            let _ = conn.execute_batch("rollback");
+            Err(error)
+        }
+    }
+}
+
+fn rename_account_rows(
+    conn: &Connection,
+    old_name: &str,
+    new_name: &str,
+    new_codex_home: PathBuf,
+) -> Result<()> {
+    let updated = conn.execute(
+        "update accounts set name = ?1, codex_home = ?2 where name = ?3",
+        params![
+            new_name,
+            new_codex_home.to_string_lossy().to_string(),
+            old_name
+        ],
+    )?;
+    if updated == 0 {
+        return Err(anyhow!("unknown account `{}`", old_name));
+    }
+    conn.execute(
+        "update pool_accounts set account = ?1 where account = ?2",
+        params![new_name, old_name],
+    )?;
+    conn.execute(
+        "update sessions set current_account = ?1, updated_at = ?2 where current_account = ?3",
+        params![new_name, util::now(), old_name],
+    )?;
+    conn.execute(
+        "update events set target = ?1 where target = ?2 and kind like 'account.%'",
+        params![new_name, old_name],
     )?;
     Ok(())
 }
@@ -547,6 +599,14 @@ pub fn delete_indexed_codex_session(conn: &Connection, path: &Path) -> Result<()
     Ok(())
 }
 
+pub fn delete_indexed_codex_sessions_for_home(conn: &Connection, home_path: &Path) -> Result<()> {
+    conn.execute(
+        "delete from codex_sessions where home_path = ?1",
+        params![home_path.to_string_lossy().to_string()],
+    )?;
+    Ok(())
+}
+
 pub fn get_cached_limit_snapshot(
     conn: &Connection,
     home_path: &Path,
@@ -618,4 +678,70 @@ fn row_to_indexed_codex_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<Ind
         modified_nanos: row.get(5)?,
         size_bytes: row.get(6)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rename_account_updates_registry_references() {
+        let conn = Connection::open_in_memory().unwrap();
+        init(&conn).unwrap();
+
+        upsert_account(&conn, "old", PathBuf::from("/tmp/cx-old")).unwrap();
+        create_pool(&conn, "coding", &["old".to_string()], "limit-aware").unwrap();
+        insert_session(
+            &conn,
+            NewSession {
+                name: "old".to_string(),
+                pool: Some("coding".to_string()),
+                current_account: "old".to_string(),
+                cwd: PathBuf::from("/tmp/project"),
+                tmux_session: Some("tmux".to_string()),
+                tmux_window: Some("@1".to_string()),
+                tmux_pane: Some("%1".to_string()),
+                codex_args: vec!["exec".to_string()],
+                resume_prompt: None,
+                status: "running".to_string(),
+            },
+        )
+        .unwrap();
+        log_event(&conn, "account.disabled", Some("old"), "disabled").unwrap();
+        log_event(&conn, "session.start", Some("old"), "started").unwrap();
+
+        rename_account(&conn, "old", "new", PathBuf::from("/tmp/cx-new")).unwrap();
+
+        assert!(get_account(&conn, "old").unwrap().is_none());
+        assert_eq!(
+            get_account(&conn, "new")
+                .unwrap()
+                .unwrap()
+                .codex_home
+                .to_string_lossy(),
+            "/tmp/cx-new"
+        );
+        assert_eq!(get_pool_accounts(&conn, "coding").unwrap(), vec!["new"]);
+        assert_eq!(
+            get_session(&conn, "old").unwrap().unwrap().current_account,
+            "new"
+        );
+
+        let account_target: String = conn
+            .query_row(
+                "select target from events where kind = 'account.disabled'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let session_target: String = conn
+            .query_row(
+                "select target from events where kind = 'session.start'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(account_target, "new");
+        assert_eq!(session_target, "old");
+    }
 }

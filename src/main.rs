@@ -191,6 +191,13 @@ enum AccountCommand {
         #[arg(help = "Account name")]
         name: String,
     },
+    #[command(about = "Rename an account profile")]
+    Rename {
+        #[arg(value_name = "OLD", help = "Current account name")]
+        old_name: String,
+        #[arg(value_name = "NEW", help = "New account name")]
+        new_name: String,
+    },
     #[command(about = "List registered account profiles")]
     List,
     #[command(about = "Check account authentication status")]
@@ -396,6 +403,9 @@ fn handle_account(conn: &Connection, command: AccountCommand) -> Result<()> {
         AccountCommand::Add { name, codex_home } => account::add(conn, &name, codex_home),
         AccountCommand::Login { name } => account::login(conn, &name),
         AccountCommand::Logout { name } => account::logout(conn, &name),
+        AccountCommand::Rename { old_name, new_name } => {
+            account::rename(conn, &old_name, &new_name)
+        }
         AccountCommand::List => account::list(conn),
         AccountCommand::Check { name, all, online } => {
             if all {

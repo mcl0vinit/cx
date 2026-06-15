@@ -369,6 +369,7 @@ It checks:
 cx account add NAME [--codex-home PATH]
 cx account login NAME
 cx account logout NAME
+cx account rename OLD NEW
 cx account list
 cx account status [NAME] [--online]
 cx account check NAME [--online]

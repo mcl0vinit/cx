@@ -121,6 +121,80 @@ pub fn logout(conn: &Connection, name: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn rename(conn: &Connection, old_name: &str, new_name: &str) -> Result<()> {
+    if old_name == new_name {
+        anyhow::bail!("old and new account names are the same");
+    }
+
+    let account = db::get_account(conn, old_name)?
+        .ok_or_else(|| anyhow!("unknown account `{}`", old_name))?;
+    if db::get_account(conn, new_name)?.is_some() {
+        anyhow::bail!("account `{}` already exists", new_name);
+    }
+
+    let old_default_home = default_account_home(old_name)?;
+    let new_default_home = default_account_home(new_name)?;
+    let uses_managed_home = same_path_or_text(&account.codex_home, &old_default_home);
+    let new_home = if uses_managed_home {
+        new_default_home.clone()
+    } else {
+        account.codex_home.clone()
+    };
+    let old_cache_home =
+        fs::canonicalize(&account.codex_home).unwrap_or_else(|_| account.codex_home.clone());
+
+    let moved_home = if uses_managed_home && account.codex_home.exists() {
+        if new_home.exists() {
+            anyhow::bail!(
+                "target account home already exists at {}; move or remove it first",
+                util::display_path(&new_home)
+            );
+        }
+        if let Some(parent) = new_home.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::rename(&account.codex_home, &new_home).with_context(|| {
+            format!(
+                "failed to move account home from {} to {}",
+                account.codex_home.display(),
+                new_home.display()
+            )
+        })?;
+        true
+    } else {
+        false
+    };
+
+    if let Err(error) = db::rename_account(conn, old_name, new_name, new_home.clone()) {
+        if moved_home {
+            let _ = fs::rename(&new_home, &account.codex_home);
+        }
+        return Err(error);
+    }
+
+    if uses_managed_home {
+        cleanup_renamed_home_cache(conn, &old_cache_home);
+    }
+    db::log_event(
+        conn,
+        "account.renamed",
+        Some(new_name),
+        &format!("renamed from `{old_name}`"),
+    )?;
+
+    if moved_home {
+        println!(
+            "renamed account `{}` to `{}` and moved home to {}",
+            old_name,
+            new_name,
+            util::display_path(&new_home)
+        );
+    } else {
+        println!("renamed account `{}` to `{}`", old_name, new_name);
+    }
+    Ok(())
+}
+
 pub fn list(conn: &Connection) -> Result<()> {
     let accounts = db::list_accounts(conn)?;
     if accounts.is_empty() {
@@ -180,6 +254,22 @@ pub fn list(conn: &Connection) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn cleanup_renamed_home_cache(conn: &Connection, old_home: &Path) {
+    if let Err(error) = db::delete_cached_limit_snapshot(conn, old_home) {
+        tracing::debug!(error = %error, "failed to delete renamed account limit cache");
+    }
+    if let Err(error) = db::delete_indexed_codex_sessions_for_home(conn, old_home) {
+        tracing::debug!(error = %error, "failed to delete renamed account session index");
+    }
+}
+
+fn same_path_or_text(left: &Path, right: &Path) -> bool {
+    match (fs::canonicalize(left), fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
 }
 
 pub fn disable(conn: &Connection, name: &str, reason: Option<&str>) -> Result<()> {
