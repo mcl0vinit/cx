@@ -79,9 +79,9 @@ pub fn compact_observed_age(snapshot: Option<&LimitSnapshot>) -> String {
         .unwrap_or_else(|| "-".to_string())
 }
 
-pub fn compact_used(window: Option<&LimitWindow>) -> String {
+pub fn compact_remaining(window: Option<&LimitWindow>) -> String {
     window
-        .map(|window| format!("{:.0}%", window.used_percent))
+        .map(|window| format!("{:.0}%", remaining_percent(window)))
         .unwrap_or_else(|| "-".to_string())
 }
 
@@ -137,8 +137,8 @@ fn print_window(label: &str, window: &LimitWindow) {
         .map(format_reset)
         .unwrap_or_else(|| "-".to_string());
     println!(
-        "{:<18} {:.1}% used, {:.1}% remaining, resets {} ({})",
-        label, window.used_percent, remaining, reset, window_label
+        "{:<18} {:.1}% remaining, resets {} ({})",
+        label, remaining, reset, window_label
     );
 }
 

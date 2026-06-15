@@ -258,8 +258,8 @@ fn status_row(conn: &Connection, name: &str, online: bool) -> Result<AccountStat
         email: auth_email(&account.codex_home).unwrap_or_else(|| "-".to_string()),
         codex_sessions,
         managed_sessions,
-        five_hour: limits::compact_used(five),
-        weekly: limits::compact_used(weekly),
+        five_hour: limits::compact_remaining(five),
+        weekly: limits::compact_remaining(weekly),
         five_hour_reset: limits::compact_reset(five),
         weekly_reset: limits::compact_reset(weekly),
         observed: limits::compact_observed_age(snapshot.as_ref()),
@@ -272,7 +272,7 @@ fn status_row(conn: &Connection, name: &str, online: bool) -> Result<AccountStat
 fn print_status_table(rows: &[AccountStatusRow]) {
     println!("{}", heading("Accounts"));
     let headers = [
-        "ACCOUNT", "STATUS", "EMAIL", "CODEX", "MGD", "5H", "WEEKLY", "5H RESET", "WK RESET",
+        "ACCOUNT", "STATUS", "EMAIL", "CODEX", "MGD", "5H LEFT", "WK LEFT", "5H RESET", "WK RESET",
         "OBSERVED",
     ];
     let table_rows = rows

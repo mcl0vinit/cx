@@ -31,7 +31,7 @@ pub fn print_once(conn: &Connection) -> Result<()> {
     println!();
     println!(
         "{:<16} {:<12} {:>7} {:>7} {:>10} {:>10} {:>7} {:>9} HOME",
-        "ACCOUNT", "STATUS", "5H", "WEEKLY", "5H RESET", "WK RESET", "ACTIVE", "OBSERVED"
+        "ACCOUNT", "STATUS", "5H LEFT", "WK LEFT", "5H RESET", "WK RESET", "ACTIVE", "OBSERVED"
     );
 
     for account in db::list_accounts(conn)? {
@@ -53,8 +53,8 @@ pub fn print_once(conn: &Connection) -> Result<()> {
             "{:<16} {:<12} {:>7} {:>7} {:>10} {:>10} {:>7} {:>9} {}",
             account.name,
             status,
-            limits::compact_used(five),
-            limits::compact_used(weekly),
+            limits::compact_remaining(five),
+            limits::compact_remaining(weekly),
             limits::compact_reset(five),
             limits::compact_reset(weekly),
             active,

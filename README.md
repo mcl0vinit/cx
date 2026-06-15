@@ -165,8 +165,8 @@ CX_CODEX_BIN=/path/to/codex cx run --account personal -- --help
 
 Codex writes `rate_limits` snapshots into session JSONL files. `cx` reads the latest local snapshot and shows:
 
-- 5h limit usage and reset
-- weekly limit usage and reset
+- 5h capacity remaining and reset
+- weekly capacity remaining and reset
 - observed snapshot age
 - account health and active managed sessions
 
@@ -202,8 +202,8 @@ cx refresh --all --stale
 
 `limit-aware` routing chooses the eligible account with:
 
-1. lowest 5h usage
-2. then lowest weekly usage
+1. most 5h capacity remaining
+2. then most weekly capacity remaining
 3. then fewest active managed sessions
 
 It skips accounts whose latest local snapshot shows an unexpired exhausted 5h or weekly limit. Accounts without snapshots are still usable, but score as unknown rather than best.
@@ -213,7 +213,7 @@ Pool strategies:
 ```text
 first-healthy   first eligible account in pool order
 least-sessions  fewest active managed sessions
-limit-aware     lowest 5h usage, then weekly usage, then sessions
+limit-aware     most 5h capacity remaining, then weekly remaining, then sessions
 ```
 
 ### Resume
