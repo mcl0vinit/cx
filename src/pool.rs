@@ -1,4 +1,5 @@
 use crate::{
+    config,
     db::{self, Account},
     limits,
 };
@@ -57,11 +58,15 @@ pub fn choose(
     pool_name: Option<&str>,
     exclude_account: Option<&str>,
 ) -> Result<Account> {
+    let configured_pool = configured_pool_name(pool_name)?;
     match (explicit_account, pool_name) {
         (Some(_), Some(_)) => anyhow::bail!("use either --account or --pool, not both"),
         (Some(account), None) => choose_account(conn, account),
         (None, Some(pool)) => choose_from_pool(conn, pool, exclude_account),
-        (None, None) => anyhow::bail!("missing --account or --pool"),
+        (None, None) => match configured_pool.as_deref() {
+            Some(pool) => choose_from_pool(conn, pool, exclude_account),
+            None => anyhow::bail!("missing --account or --pool"),
+        },
     }
 }
 
@@ -70,7 +75,8 @@ pub fn choose_smart(
     pool_name: Option<&str>,
     exclude_account: Option<&str>,
 ) -> Result<Account> {
-    let accounts = match pool_name {
+    let configured_pool = configured_pool_name(pool_name)?;
+    let accounts = match configured_pool.as_deref() {
         Some(pool_name) => {
             db::get_pool(conn, pool_name)?
                 .ok_or_else(|| anyhow!("unknown pool `{}`", pool_name))?;
@@ -85,9 +91,26 @@ pub fn choose_smart(
     choose_limit_aware(
         conn,
         accounts,
-        pool_name.unwrap_or("all accounts"),
+        configured_pool.as_deref().unwrap_or("all accounts"),
         exclude_account,
     )
+}
+
+pub fn default_strategy() -> Result<String> {
+    Ok(config::load()?
+        .default_strategy
+        .filter(|strategy| !strategy.trim().is_empty())
+        .unwrap_or_else(|| "least-sessions".to_string()))
+}
+
+pub fn configured_pool_name(pool_name: Option<&str>) -> Result<Option<String>> {
+    if let Some(pool_name) = pool_name {
+        return Ok(Some(pool_name.to_string()));
+    }
+
+    Ok(config::load()?
+        .default_pool
+        .filter(|pool| !pool.trim().is_empty()))
 }
 
 fn choose_account(conn: &Connection, name: &str) -> Result<Account> {

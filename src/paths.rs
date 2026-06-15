@@ -30,6 +30,10 @@ pub fn log_path() -> Result<PathBuf> {
     Ok(cx_root()?.join("cxd.log"))
 }
 
+pub fn config_path() -> Result<PathBuf> {
+    Ok(cx_root()?.join("config.toml"))
+}
+
 pub fn ensure_root_dirs() -> Result<()> {
     std::fs::create_dir_all(cx_root()?)?;
     std::fs::create_dir_all(accounts_dir()?)?;

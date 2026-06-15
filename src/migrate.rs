@@ -1,4 +1,4 @@
-use crate::{codex, db, pool, tmux, util};
+use crate::{codex, db, pool, resume, tmux, util};
 use anyhow::{anyhow, Result};
 use rusqlite::Connection;
 
@@ -85,22 +85,38 @@ pub fn migrate_to_account(
         .ok_or_else(|| anyhow!("unknown account `{}`", target_account))?;
     let same_account = session.current_account == target.name;
 
-    let args = if same_account {
-        codex::same_account_resume_args()
+    let (args, command_cwd, used_native_history) = if same_account {
+        (codex::same_account_resume_args(), session.cwd.clone(), true)
     } else {
-        codex::cross_account_resume_args(
-            &session.name,
+        match resume::resolve_here_invocation(
+            conn,
+            Some((target.name.as_str(), target.codex_home.as_path())),
             &session.cwd,
-            &session.current_account,
-            session.resume_prompt.as_deref(),
-        )
+            &[],
+        ) {
+            Ok(resolved) => (
+                resolved.args,
+                resolved.cwd.unwrap_or_else(|| session.cwd.clone()),
+                true,
+            ),
+            Err(_) => (
+                codex::cross_account_resume_args(
+                    &session.name,
+                    &session.cwd,
+                    &session.current_account,
+                    session.resume_prompt.as_deref(),
+                ),
+                session.cwd.clone(),
+                false,
+            ),
+        }
     };
 
     let command = codex::shell_command(&target.codex_home, &args);
 
     if let Some(pane) = &session.tmux_pane {
         if tmux::pane_exists(pane)? {
-            tmux::respawn_pane(pane, &session.cwd, &command)?;
+            tmux::respawn_pane(pane, &command_cwd, &command)?;
             db::update_session_after_respawn(
                 conn,
                 &session.name,
@@ -114,7 +130,15 @@ pub fn migrate_to_account(
                 conn,
                 "session.migrate",
                 Some(&session.name),
-                &format!("respawned pane under account `{}`", target.name),
+                &format!(
+                    "respawned pane under account `{}` ({})",
+                    target.name,
+                    if used_native_history {
+                        "native history"
+                    } else {
+                        "semantic prompt"
+                    }
+                ),
             )?;
             println!(
                 "migrated `{}` in-place in pane {}: {} -> {}",
@@ -124,7 +148,7 @@ pub fn migrate_to_account(
         }
     }
 
-    let target_tmux = tmux::new_window(&session.name, &session.cwd, &command)?;
+    let target_tmux = tmux::new_window(&session.name, &command_cwd, &command)?;
     db::update_session_after_respawn(
         conn,
         &session.name,
@@ -138,7 +162,15 @@ pub fn migrate_to_account(
         conn,
         "session.migrate",
         Some(&session.name),
-        &format!("created new tmux window under account `{}`", target.name),
+        &format!(
+            "created new tmux window under account `{}` ({})",
+            target.name,
+            if used_native_history {
+                "native history"
+            } else {
+                "semantic prompt"
+            }
+        ),
     )?;
     println!(
         "migrated `{}` to new pane {}: {} -> {}",

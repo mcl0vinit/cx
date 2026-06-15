@@ -1,19 +1,23 @@
-# Future config shape. v0.1 mostly uses SQLite and CLI commands.
+# Default pool used by `cx run`, `cx smart`, and `cx resume-here --smart`
+# when a pool is not supplied.
+default_pool = "coding"
+
+# Default strategy for `cx pool create` when --strategy is omitted.
+default_strategy = "limit-aware"
+
+# Snapshot age shown by `cx doctor`; stale snapshots can still be used unless
+# smart.refresh_before_pick is enabled.
+limit_snapshot_max_age_minutes = 30
+
+# Override Codex launcher. CX_CODEX_BIN still wins when set.
+# codex_bin = "~/bin/codex"
+
+[smart]
+# If true, `cx smart` refreshes accounts with stale/missing limit snapshots
+# before picking. This runs `codex exec` and may consume usage.
+refresh_before_pick = false
 
 [daemon]
-health_check_interval = "30s"
-on_usage_limited = "pause"
-on_auth_failed = "auto-migrate"
-on_account_disabled = "auto-migrate"
-on_pane_dead = "restart-same-account"
-
-[accounts.personal]
-codex_home = "~/.cx/accounts/personal"
-
-[accounts.work]
-codex_home = "~/.cx/accounts/work"
-
-[pools.coding]
-accounts = ["personal", "work"]
-strategy = "least-sessions"
-failover = "manual"
+auto_migrate_auth_failed = true
+auto_migrate_limited = false
+auto_migrate_degraded = false

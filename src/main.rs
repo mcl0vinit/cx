@@ -1,8 +1,10 @@
 mod account;
 mod codex;
+mod config;
 mod daemon;
 mod dashboard;
 mod db;
+mod doctor;
 mod limits;
 mod migrate;
 mod paths;
@@ -13,6 +15,7 @@ mod util;
 
 use anyhow::{anyhow, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::Shell;
 use rusqlite::Connection;
 use std::{path::PathBuf, process::Stdio};
 
@@ -48,10 +51,22 @@ enum Commands {
     Smart {
         #[arg(short, long)]
         pool: Option<String>,
+        #[arg(
+            long,
+            help = "Refresh stale/missing limit snapshots before picking. This may consume usage."
+        )]
+        refresh: bool,
         #[arg(short = 'C', long)]
         cwd: Option<PathBuf>,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
+    },
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
+    Completion {
+        shell: Shell,
     },
     Tmux {
         #[command(subcommand)]
@@ -90,12 +105,22 @@ enum Commands {
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
+    Refresh {
+        name: Option<String>,
+        #[arg(long)]
+        all: bool,
+        #[arg(short, long)]
+        pool: Option<String>,
+        #[arg(long, help = "Only refresh accounts with stale or missing snapshots.")]
+        stale: bool,
+    },
     Watch {
         #[arg(long, default_value_t = 5)]
         interval_secs: u64,
         #[arg(long, help = "Print one dashboard frame and exit.")]
         once: bool,
     },
+    Doctor,
     Status,
     Daemon {
         #[command(subcommand)]
@@ -151,10 +176,20 @@ enum PoolCommand {
         name: String,
         #[arg(long)]
         accounts: String,
-        #[arg(long, default_value = "least-sessions")]
-        strategy: String,
+        #[arg(long)]
+        strategy: Option<String>,
     },
     List,
+}
+
+#[derive(Subcommand, Debug)]
+enum ConfigCommand {
+    Init {
+        #[arg(long)]
+        force: bool,
+    },
+    Path,
+    Show,
 }
 
 #[derive(Subcommand, Debug)]
@@ -216,9 +251,20 @@ fn main() -> Result<()> {
             cwd,
             args,
         }) => handle_run(&conn, account.as_deref(), pool.as_deref(), cwd, args),
-        Some(Commands::Smart { pool, cwd, args }) => {
-            handle_smart(&conn, pool.as_deref(), cwd, args)
-        }
+        Some(Commands::Smart {
+            pool,
+            refresh,
+            cwd,
+            args,
+        }) => handle_smart(&conn, pool.as_deref(), refresh, cwd, args),
+        Some(Commands::Config { command }) => handle_config(command),
+        Some(Commands::Completion { shell }) => handle_completion(shell),
+        Some(Commands::Refresh {
+            name,
+            all,
+            pool,
+            stale,
+        }) => handle_refresh(&conn, name.as_deref(), all, pool.as_deref(), stale),
         Some(Commands::Tmux { command }) => handle_tmux(&conn, command),
         Some(Commands::Migrate {
             name,
@@ -239,6 +285,7 @@ fn main() -> Result<()> {
             interval_secs,
             once,
         }) => dashboard::watch(&conn, interval_secs, once),
+        Some(Commands::Doctor) => doctor::run(&conn),
         Some(Commands::Status) => handle_status(&conn),
         Some(Commands::Daemon { command }) => handle_daemon(command),
         None => {
@@ -246,6 +293,13 @@ fn main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn handle_completion(shell: Shell) -> Result<()> {
+    let mut command = Cli::command();
+    let name = command.get_name().to_string();
+    clap_complete::generate(shell, &mut command, name, &mut std::io::stdout());
+    Ok(())
 }
 
 fn handle_account(conn: &Connection, command: AccountCommand) -> Result<()> {
@@ -282,7 +336,10 @@ fn handle_pool(conn: &Connection, command: PoolCommand) -> Result<()> {
             name,
             accounts,
             strategy,
-        } => pool::create(conn, &name, &accounts, &strategy),
+        } => {
+            let strategy = strategy.unwrap_or(pool::default_strategy()?);
+            pool::create(conn, &name, &accounts, &strategy)
+        }
         PoolCommand::List => pool::list(conn),
     }
 }
@@ -307,9 +364,13 @@ fn handle_run(
 fn handle_smart(
     conn: &Connection,
     pool_name: Option<&str>,
+    refresh: bool,
     cwd: Option<PathBuf>,
     args: Vec<String>,
 ) -> Result<()> {
+    if refresh || config::load()?.smart_refresh_before_pick() {
+        refresh_targets(conn, None, false, pool_name, true)?;
+    }
     let chosen = pool::choose_smart(conn, pool_name, None)?;
     let args = util::normalize_passthrough(args);
     eprintln!("using account `{}`", chosen.name);
@@ -319,6 +380,70 @@ fn handle_smart(
         return run_codex_direct(&resolved.home, cwd.or(resolved.cwd), &resolved.args);
     }
     run_codex_direct(&chosen.codex_home, cwd, &args)
+}
+
+fn handle_config(command: ConfigCommand) -> Result<()> {
+    match command {
+        ConfigCommand::Init { force } => config::init(force),
+        ConfigCommand::Path => config::print_path(),
+        ConfigCommand::Show => config::print_config(),
+    }
+}
+
+fn handle_refresh(
+    conn: &Connection,
+    name: Option<&str>,
+    all: bool,
+    pool_name: Option<&str>,
+    stale_only: bool,
+) -> Result<()> {
+    refresh_targets(conn, name, all, pool_name, stale_only)
+}
+
+fn refresh_targets(
+    conn: &Connection,
+    name: Option<&str>,
+    all: bool,
+    pool_name: Option<&str>,
+    stale_only: bool,
+) -> Result<()> {
+    let names = refresh_names(conn, name, all, pool_name)?;
+    account::refresh(conn, &names, stale_only)
+}
+
+fn refresh_names(
+    conn: &Connection,
+    name: Option<&str>,
+    all: bool,
+    pool_name: Option<&str>,
+) -> Result<Vec<String>> {
+    if name.is_some() && (all || pool_name.is_some()) {
+        anyhow::bail!("use a name, --all, or --pool, not multiple targets");
+    }
+    if all && pool_name.is_some() {
+        anyhow::bail!("use --all or --pool, not both");
+    }
+
+    if let Some(name) = name {
+        db::get_account(conn, name)?.ok_or_else(|| anyhow!("unknown account `{}`", name))?;
+        return Ok(vec![name.to_string()]);
+    }
+    if all {
+        return Ok(db::list_accounts(conn)?
+            .into_iter()
+            .map(|account| account.name)
+            .collect());
+    }
+
+    if let Some(pool_name) = pool::configured_pool_name(pool_name)? {
+        db::get_pool(conn, &pool_name)?.ok_or_else(|| anyhow!("unknown pool `{}`", pool_name))?;
+        return db::get_pool_accounts(conn, &pool_name);
+    }
+
+    Ok(db::list_accounts(conn)?
+        .into_iter()
+        .map(|account| account.name)
+        .collect())
 }
 
 fn handle_adopt(conn: &Connection, account_name: &str, session: &str) -> Result<()> {
@@ -477,6 +602,8 @@ fn is_reserved_command(name: &str) -> bool {
             | "pool"
             | "run"
             | "smart"
+            | "config"
+            | "completion"
             | "tmux"
             | "migrate"
             | "restart"
@@ -484,7 +611,9 @@ fn is_reserved_command(name: &str) -> bool {
             | "resume"
             | "resume-here"
             | "sessions"
+            | "refresh"
             | "watch"
+            | "doctor"
             | "status"
             | "daemon"
             | "help"

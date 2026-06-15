@@ -1,4 +1,4 @@
-use crate::{codex, db, limits, paths, util};
+use crate::{codex, config, db, limits, paths, util};
 use anyhow::{anyhow, Context, Result};
 use rusqlite::Connection;
 use std::{fs, path::PathBuf, process::Stdio};
@@ -280,6 +280,27 @@ pub fn online_check(conn: &Connection, name: &str) -> Result<String> {
 
     db::set_account_status(conn, name, status, error.as_deref())?;
     Ok(status.to_string())
+}
+
+pub fn refresh(conn: &Connection, names: &[String], stale_only: bool) -> Result<()> {
+    for name in names {
+        let outcome = refresh_one(conn, name, stale_only)?;
+        println!("{:<20} {}", name, outcome);
+    }
+    Ok(())
+}
+
+pub fn refresh_one(conn: &Connection, name: &str, stale_only: bool) -> Result<String> {
+    let account =
+        db::get_account(conn, name)?.ok_or_else(|| anyhow!("unknown account `{}`", name))?;
+    if stale_only {
+        let cfg = config::load()?;
+        let snapshot = limits::latest_snapshot(&account.codex_home)?;
+        if !limits::is_stale(snapshot.as_ref(), cfg.limit_snapshot_max_age_minutes()) {
+            return Ok("fresh".to_string());
+        }
+    }
+    online_check(conn, name)
 }
 
 fn first_line(s: &str) -> String {

@@ -1,4 +1,4 @@
-use crate::{account, db, migrate, paths, pool, tmux};
+use crate::{account, config, db, migrate, paths, pool, tmux};
 use anyhow::{anyhow, Context, Result};
 use rusqlite::Connection;
 use std::{
@@ -86,8 +86,9 @@ pub fn run_forever(interval_secs: Option<u64>) -> Result<()> {
 }
 
 fn tick(conn: &Connection) -> Result<()> {
+    let cfg = config::load()?;
     refresh_local_account_status(conn)?;
-    supervise_sessions(conn)?;
+    supervise_sessions(conn, &cfg)?;
     Ok(())
 }
 
@@ -99,7 +100,7 @@ fn refresh_local_account_status(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn supervise_sessions(conn: &Connection) -> Result<()> {
+fn supervise_sessions(conn: &Connection, cfg: &config::Config) -> Result<()> {
     let sessions = db::list_sessions(conn)?;
     for session in sessions {
         let account = match db::get_account(conn, &session.current_account)? {
@@ -124,7 +125,7 @@ fn supervise_sessions(conn: &Connection) -> Result<()> {
             continue;
         }
 
-        if should_auto_migrate_account(&account.status) || account.disabled {
+        if should_auto_migrate_account(&account.status, account.disabled, cfg) {
             if let Some(pool_name) = &session.pool {
                 match pool::choose(conn, None, Some(pool_name), Some(&session.current_account)) {
                     Ok(target) => {
@@ -155,13 +156,29 @@ fn supervise_sessions(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn should_auto_migrate_account(status: &str) -> bool {
-    matches!(status, "auth_failed" | "disabled")
+fn should_auto_migrate_account(status: &str, disabled: bool, cfg: &config::Config) -> bool {
+    if disabled || status == "disabled" {
+        return true;
+    }
+    match status {
+        "auth_failed" => cfg.daemon_auto_migrate_auth_failed(),
+        "limited" => cfg.daemon_auto_migrate_limited(),
+        "degraded" => cfg.daemon_auto_migrate_degraded(),
+        _ => false,
+    }
 }
 
 fn read_pid() -> Result<u32> {
     let text = fs::read_to_string(paths::pid_path()?).context("cxd pid file not found")?;
     text.trim().parse::<u32>().map_err(Into::into)
+}
+
+pub fn running_pid() -> Result<Option<u32>> {
+    if is_running()? {
+        Ok(Some(read_pid()?))
+    } else {
+        Ok(None)
+    }
 }
 
 fn is_running() -> Result<bool> {

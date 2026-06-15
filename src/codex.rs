@@ -1,4 +1,4 @@
-use crate::util;
+use crate::{config, util};
 use std::{
     path::{Path, PathBuf},
     process::Command,
@@ -7,6 +7,10 @@ use std::{
 pub fn bin_path() -> PathBuf {
     if let Ok(value) = std::env::var("CX_CODEX_BIN") {
         return PathBuf::from(value);
+    }
+
+    if let Ok(Some(path)) = config::load().map(|config| config.codex_bin()) {
+        return path;
     }
 
     if let Some(home) = dirs::home_dir() {

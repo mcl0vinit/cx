@@ -85,6 +85,13 @@ pub fn compact_used(window: Option<&LimitWindow>) -> String {
         .unwrap_or_else(|| "-".to_string())
 }
 
+pub fn is_stale(snapshot: Option<&LimitSnapshot>, max_age_minutes: i64) -> bool {
+    let Some(snapshot) = snapshot else {
+        return true;
+    };
+    (Utc::now() - snapshot.observed_at).num_minutes() > max_age_minutes
+}
+
 pub fn print_snapshot(snapshot: &LimitSnapshot) {
     println!("Limits");
     println!(
