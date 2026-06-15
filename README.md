@@ -20,6 +20,8 @@ CODEX_HOME="$HOME/.cx/accounts/work" codex resume --last
 
 `cx` wraps that pattern and adds account routing, session discovery, limit status, and optional tmux management.
 
+![cx demo](assets/cx-demo.gif)
+
 ## Install
 
 ```bash
@@ -405,9 +407,17 @@ cargo test
 cargo clippy -- -D warnings
 ```
 
+Regenerate the terminal demo:
+
+```bash
+./demo/setup.sh
+vhs demo/cx.tape
+```
+
+The demo fixture writes under `target/demo` and records through `/tmp/cx-demo`, so the GIF stays machine-neutral and does not touch real Codex accounts.
+
 Obvious next steps:
 
 1. Add a Unix-socket RPC layer so `cx` talks to `cxd` instead of both touching SQLite.
 2. Add release packaging.
 3. Add better process/log inspection to classify account health from Codex stderr.
-4. Add a Unix-socket RPC layer when daemon coordination outgrows direct SQLite.
