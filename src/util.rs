@@ -1,5 +1,5 @@
 use chrono::Utc;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub fn now() -> String {
     Utc::now().to_rfc3339()
@@ -26,6 +26,23 @@ pub fn split_csv(s: &str) -> Vec<String> {
         .filter(|s| !s.is_empty())
         .map(ToOwned::to_owned)
         .collect()
+}
+
+pub fn expand_tilde(path: PathBuf) -> PathBuf {
+    let text = path.as_os_str().to_string_lossy();
+    let Some(home) = dirs::home_dir() else {
+        return path;
+    };
+
+    if text == "~" {
+        return home;
+    }
+
+    if let Some(rest) = text.strip_prefix("~/") {
+        return home.join(rest);
+    }
+
+    path
 }
 
 pub fn display_path(path: &Path) -> String {

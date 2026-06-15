@@ -20,10 +20,15 @@ pub fn new_window(name: &str, cwd: &Path, shell_command: &str) -> Result<TmuxTar
         .arg(cwd)
         .arg(shell_command)
         .output()
-        .context("failed to run `tmux new-window`; are you inside tmux or is a tmux server running?")?;
+        .context(
+            "failed to run `tmux new-window`; are you inside tmux or is a tmux server running?",
+        )?;
 
     if !output.status.success() {
-        anyhow::bail!("tmux new-window failed: {}", String::from_utf8_lossy(&output.stderr).trim());
+        anyhow::bail!(
+            "tmux new-window failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
     }
 
     parse_target(String::from_utf8_lossy(&output.stdout).trim())
@@ -42,7 +47,10 @@ pub fn respawn_pane(pane_id: &str, cwd: &Path, shell_command: &str) -> Result<()
         .context("failed to run `tmux respawn-pane`")?;
 
     if !output.status.success() {
-        anyhow::bail!("tmux respawn-pane failed: {}", String::from_utf8_lossy(&output.stderr).trim());
+        anyhow::bail!(
+            "tmux respawn-pane failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
     }
 
     Ok(())

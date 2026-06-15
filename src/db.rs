@@ -161,10 +161,16 @@ pub fn list_accounts(conn: &Connection) -> Result<Vec<Account>> {
         })
     })?;
 
-    rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
 }
 
-pub fn set_account_status(conn: &Connection, name: &str, status: &str, error: Option<&str>) -> Result<()> {
+pub fn set_account_status(
+    conn: &Connection,
+    name: &str,
+    status: &str,
+    error: Option<&str>,
+) -> Result<()> {
     conn.execute(
         "update accounts set status = ?1, last_checked_at = ?2, last_error = ?3 where name = ?4",
         params![status, util::now(), error, name],
@@ -180,7 +186,12 @@ pub fn set_account_disabled(conn: &Connection, name: &str, disabled: bool) -> Re
     Ok(())
 }
 
-pub fn create_pool(conn: &Connection, name: &str, accounts: &[String], strategy: &str) -> Result<()> {
+pub fn create_pool(
+    conn: &Connection,
+    name: &str,
+    accounts: &[String],
+    strategy: &str,
+) -> Result<()> {
     conn.execute(
         "insert into pools (name, strategy, failover) values (?1, ?2, 'manual') on conflict(name) do update set strategy = excluded.strategy",
         params![name, strategy],
@@ -204,7 +215,8 @@ pub fn list_pools(conn: &Connection) -> Result<Vec<Pool>> {
             failover: row.get(2)?,
         })
     })?;
-    rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
 }
 
 pub fn get_pool(conn: &Connection, name: &str) -> Result<Option<Pool>> {
@@ -228,7 +240,8 @@ pub fn get_pool_accounts(conn: &Connection, pool: &str) -> Result<Vec<String>> {
         "select account from pool_accounts where pool = ?1 order by priority asc, account asc",
     )?;
     let rows = stmt.query_map(params![pool], |row| row.get::<_, String>(0))?;
-    rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
 }
 
 pub fn active_session_count(conn: &Connection, account: &str) -> Result<i64> {
@@ -322,7 +335,8 @@ pub fn list_sessions(conn: &Connection) -> Result<Vec<Session>> {
         "#,
     )?;
     let rows = stmt.query_map([], row_to_session)?;
-    rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
 }
 
 pub fn update_session_after_respawn(
@@ -345,7 +359,15 @@ pub fn update_session_after_respawn(
             updated_at = ?6
         where name = ?7
         "#,
-        params![account, tmux_session, tmux_window, tmux_pane, status, util::now(), session_name],
+        params![
+            account,
+            tmux_session,
+            tmux_window,
+            tmux_pane,
+            status,
+            util::now(),
+            session_name
+        ],
     )?;
     Ok(())
 }

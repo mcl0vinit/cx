@@ -3,7 +3,7 @@ name = "cx"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "tmux-first Codex account/session supervisor using per-account CODEX_HOME profiles"
+description = "Codex account/session router using per-account CODEX_HOME profiles"
 
 [dependencies]
 anyhow = "1"

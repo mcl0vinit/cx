@@ -1,7 +1,12 @@
 use crate::{account, db, migrate, paths, pool, tmux};
 use anyhow::{anyhow, Context, Result};
 use rusqlite::Connection;
-use std::{fs::{self, OpenOptions}, process::{Command, Stdio}, thread, time::Duration};
+use std::{
+    fs::{self, OpenOptions},
+    process::{Command, Stdio},
+    thread,
+    time::Duration,
+};
 
 const DEFAULT_INTERVAL_SECS: u64 = 30;
 
@@ -11,9 +16,13 @@ pub fn start() -> Result<()> {
         println!("cxd already appears to be running");
         return Ok(());
     }
+    let _ = fs::remove_file(paths::pid_path()?);
 
     let exe = std::env::current_exe().context("could not determine current executable")?;
-    let log = OpenOptions::new().create(true).append(true).open(paths::log_path()?)?;
+    let log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(paths::log_path()?)?;
     let log_err = log.try_clone()?;
 
     let child = Command::new(exe)
@@ -33,7 +42,16 @@ pub fn start() -> Result<()> {
 
 pub fn stop() -> Result<()> {
     let pid = read_pid()?;
-    let status = Command::new("kill").arg(pid.to_string()).status().context("failed to run kill")?;
+    if !is_cxd_process(pid)? {
+        anyhow::bail!(
+            "refusing to stop pid {}; pidfile does not point to a `cx daemon run` process",
+            pid
+        );
+    }
+    let status = Command::new("kill")
+        .arg(pid.to_string())
+        .status()
+        .context("failed to run kill")?;
     if status.success() {
         let _ = fs::remove_file(paths::pid_path()?);
         println!("stopped cxd pid {}", pid);
@@ -96,7 +114,12 @@ fn supervise_sessions(conn: &Connection) -> Result<()> {
 
         if !pane_exists {
             db::set_session_status(conn, &session.name, "dead")?;
-            db::log_event(conn, "session.dead", Some(&session.name), "tmux pane missing")?;
+            db::log_event(
+                conn,
+                "session.dead",
+                Some(&session.name),
+                "tmux pane missing",
+            )?;
             let _ = migrate::restart(conn, &session.name);
             continue;
         }
@@ -105,12 +128,25 @@ fn supervise_sessions(conn: &Connection) -> Result<()> {
             if let Some(pool_name) = &session.pool {
                 match pool::choose(conn, None, Some(pool_name), Some(&session.current_account)) {
                     Ok(target) => {
-                        db::log_event(conn, "session.auto_migrate", Some(&session.name), &format!("{} -> {} because account status is {}", session.current_account, target.name, account.status))?;
+                        db::log_event(
+                            conn,
+                            "session.auto_migrate",
+                            Some(&session.name),
+                            &format!(
+                                "{} -> {} because account status is {}",
+                                session.current_account, target.name, account.status
+                            ),
+                        )?;
                         let _ = migrate::migrate_to_account(conn, &session, &target.name);
                     }
                     Err(err) => {
                         db::set_session_status(conn, &session.name, "paused")?;
-                        db::log_event(conn, "session.paused", Some(&session.name), &format!("no migration target: {err}"))?;
+                        db::log_event(
+                            conn,
+                            "session.paused",
+                            Some(&session.name),
+                            &format!("no migration target: {err}"),
+                        )?;
                     }
                 }
             }
@@ -133,9 +169,48 @@ fn is_running() -> Result<bool> {
         Ok(pid) => pid,
         Err(_) => return Ok(false),
     };
-    let status = Command::new("kill").arg("-0").arg(pid.to_string()).status();
-    match status {
-        Ok(status) => Ok(status.success()),
+    match process_exists(pid) {
+        Ok(false) => {
+            let _ = fs::remove_file(paths::pid_path()?);
+            Ok(false)
+        }
+        Ok(true) => {
+            if is_cxd_process(pid)? {
+                Ok(true)
+            } else {
+                let _ = fs::remove_file(paths::pid_path()?);
+                Ok(false)
+            }
+        }
         Err(_) => Err(anyhow!("failed to run kill -0")),
     }
+}
+
+fn process_exists(pid: u32) -> Result<bool> {
+    let status = Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .status()
+        .context("failed to run kill -0")?;
+    Ok(status.success())
+}
+
+fn is_cxd_process(pid: u32) -> Result<bool> {
+    if !process_exists(pid)? {
+        return Ok(false);
+    }
+
+    let output = Command::new("ps")
+        .arg("-p")
+        .arg(pid.to_string())
+        .arg("-o")
+        .arg("command=")
+        .output()
+        .context("failed to inspect pid command with ps")?;
+    if !output.status.success() {
+        return Ok(false);
+    }
+
+    let command = String::from_utf8_lossy(&output.stdout);
+    Ok(command.contains(" daemon run") && command.contains("cx"))
 }
