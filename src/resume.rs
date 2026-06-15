@@ -6,11 +6,13 @@ use std::{
     cmp::Reverse,
     collections::HashSet,
     fs,
-    io::{BufRead, BufReader},
+    io::{self, BufRead, BufReader, Read},
     path::{Path, PathBuf},
     process::Command,
     time::SystemTime,
 };
+
+const FILE_COMPARE_BUFFER_SIZE: usize = 1024 * 1024;
 
 pub struct ResolvedInvocation {
     pub home: PathBuf,
@@ -254,7 +256,7 @@ fn adopt_session_file(
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::copy(&source.path, &target)?;
+    copy_session_file(&source.path, &target)?;
 
     Ok(AdoptionResult {
         session_id: id,
@@ -593,7 +595,82 @@ fn target_session_path(source: &SessionFile, target_home: &Path) -> Result<PathB
 }
 
 fn files_equal(left: &Path, right: &Path) -> Result<bool> {
-    Ok(fs::read(left)? == fs::read(right)?)
+    let left_metadata = fs::metadata(left)?;
+    let right_metadata = fs::metadata(right)?;
+    if left_metadata.len() != right_metadata.len() {
+        return Ok(false);
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if left_metadata.dev() == right_metadata.dev()
+            && left_metadata.ino() == right_metadata.ino()
+        {
+            return Ok(true);
+        }
+    }
+
+    let mut left_file = fs::File::open(left)?;
+    let mut right_file = fs::File::open(right)?;
+    let mut left_buffer = vec![0; FILE_COMPARE_BUFFER_SIZE];
+    let mut right_buffer = vec![0; FILE_COMPARE_BUFFER_SIZE];
+
+    loop {
+        let left_read = left_file.read(&mut left_buffer)?;
+        let right_read = right_file.read(&mut right_buffer)?;
+        if left_read != right_read {
+            return Ok(false);
+        }
+        if left_read == 0 {
+            return Ok(true);
+        }
+        if left_buffer[..left_read] != right_buffer[..right_read] {
+            return Ok(false);
+        }
+    }
+}
+
+fn copy_session_file(source: &Path, target: &Path) -> Result<()> {
+    if let Err(error) = clone_session_file(source, target) {
+        tracing::debug!(
+            source = %source.display(),
+            target = %target.display(),
+            error = %error,
+            "session clone unavailable; falling back to byte copy"
+        );
+        fs::copy(source, target)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn clone_session_file(source: &Path, target: &Path) -> io::Result<()> {
+    use std::{ffi::CString, os::unix::ffi::OsStrExt};
+
+    extern "C" {
+        fn clonefile(src: *const i8, dst: *const i8, flags: u32) -> i32;
+    }
+
+    let source = CString::new(source.as_os_str().as_bytes())
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    let target = CString::new(target.as_os_str().as_bytes())
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+
+    let result = unsafe { clonefile(source.as_ptr(), target.as_ptr(), 0) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn clone_session_file(_source: &Path, _target: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "copy-on-write clone is not implemented on this platform",
+    ))
 }
 
 fn match_score(path: &Path, selector: &str) -> Option<u8> {
@@ -696,6 +773,7 @@ fn format_time(time: SystemTime) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_root(name: &str) -> PathBuf {
@@ -854,6 +932,38 @@ mod tests {
 
         let err = adopt_session(&conn, &target, id).unwrap_err().to_string();
         assert!(err.contains("ambiguous") || err.contains("multiple"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn session_file_copy_and_compare_are_independent() {
+        let root = temp_root("copy-compare");
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("source.jsonl");
+        let same = root.join("same.jsonl");
+        let different = root.join("different.jsonl");
+        let copied = root.join("copied.jsonl");
+
+        fs::write(&source, b"one\ntwo\nthree\n").unwrap();
+        fs::write(&same, b"one\ntwo\nthree\n").unwrap();
+        fs::write(&different, b"one\ntwo\n").unwrap();
+
+        assert!(files_equal(&source, &same).unwrap());
+        assert!(!files_equal(&source, &different).unwrap());
+
+        copy_session_file(&source, &copied).unwrap();
+        assert!(files_equal(&source, &copied).unwrap());
+
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&copied)
+            .unwrap()
+            .write_all(b"four\n")
+            .unwrap();
+
+        assert!(!files_equal(&source, &copied).unwrap());
+        assert_eq!(fs::read(&source).unwrap(), b"one\ntwo\nthree\n");
 
         let _ = fs::remove_dir_all(root);
     }
