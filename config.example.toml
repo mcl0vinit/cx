@@ -1,0 +1,19 @@
+# Future config shape. v0.1 mostly uses SQLite and CLI commands.
+
+[daemon]
+health_check_interval = "30s"
+on_usage_limited = "pause"
+on_auth_failed = "auto-migrate"
+on_account_disabled = "auto-migrate"
+on_pane_dead = "restart-same-account"
+
+[accounts.personal]
+codex_home = "~/.cx/accounts/personal"
+
+[accounts.work]
+codex_home = "~/.cx/accounts/work"
+
+[pools.coding]
+accounts = ["personal", "work"]
+strategy = "least-sessions"
+failover = "manual"
