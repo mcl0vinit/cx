@@ -30,6 +30,7 @@ fi
 ln -sfn "$demo_root" "$display_root"
 
 mkdir -p "$bin_dir" "$demo_home"
+mkdir -p "$display_root/repo"
 ln -sf "$cx_bin" "$bin_dir/cx"
 
 cat >"$fake_codex" <<'FAKE_CODEX'
@@ -139,7 +140,7 @@ JSONL
 write_session \
   personal \
   019ecc26-088b-7a53-9682-e2c3286727da \
-  "$repo_root" \
+  "$display_root/repo" \
   61.0 \
   42.0 \
   19.50

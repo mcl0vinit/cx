@@ -1,4 +1,4 @@
-use crate::{codex, db, pool, resume, tmux, util};
+use crate::{codex, db, pool, resume, tmux, ui, util};
 use anyhow::{anyhow, Result};
 use rusqlite::Connection;
 
@@ -181,31 +181,42 @@ pub fn migrate_to_account(
 
 pub fn print_sessions(conn: &Connection) -> Result<()> {
     let sessions = db::list_sessions(conn)?;
-    println!(
-        "{:<24} {:<14} {:<12} {:<8} {:<16} CWD",
-        "NAME", "ACCOUNT", "STATUS", "PANE", "POOL"
-    );
-    for session in sessions {
-        let pane = session.tmux_pane.clone().unwrap_or_else(|| "-".to_string());
-        let exists = session
-            .tmux_pane
-            .as_deref()
-            .map(|pane| tmux::pane_exists(pane).unwrap_or(false))
-            .unwrap_or(false);
-        let status = if exists {
-            session.status.clone()
-        } else {
-            format!("{}*", session.status)
-        };
-        println!(
-            "{:<24} {:<14} {:<12} {:<8} {:<16} {}",
-            session.name,
-            session.current_account,
-            status,
-            pane,
-            session.pool.unwrap_or_else(|| "-".to_string()),
-            util::display_path(&session.cwd)
-        );
+    println!("{}", ui::heading("Managed Sessions"));
+    if sessions.is_empty() {
+        println!("No managed tmux sessions.");
+        println!("Start one with `cx tmux run --name <name> --pool <pool>`.");
+        return Ok(());
     }
+
+    let rows = sessions
+        .into_iter()
+        .map(|session| {
+            let pane = session.tmux_pane.clone().unwrap_or_else(|| "-".to_string());
+            let exists = session
+                .tmux_pane
+                .as_deref()
+                .map(|pane| tmux::pane_exists(pane).unwrap_or(false))
+                .unwrap_or(false);
+            let tmux_state = if exists { "live" } else { "missing" };
+            vec![
+                session.name,
+                session.current_account,
+                session.status,
+                tmux_state.to_string(),
+                pane,
+                session.pool.unwrap_or_else(|| "-".to_string()),
+                session.updated_at,
+                util::display_path(&session.cwd),
+            ]
+        })
+        .collect::<Vec<_>>();
+
+    ui::print_table(
+        &[
+            "SESSION", "ACCOUNT", "STATUS", "TMUX", "PANE", "POOL", "UPDATED", "CWD",
+        ],
+        &rows,
+        &[],
+    );
     Ok(())
 }

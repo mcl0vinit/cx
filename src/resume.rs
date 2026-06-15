@@ -1,4 +1,4 @@
-use crate::{db, paths, util};
+use crate::{db, paths, ui, util};
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::Connection;
@@ -307,16 +307,30 @@ pub fn print_sessions(conn: &Connection, limit: usize) -> Result<()> {
     let mut sessions = all_sessions(conn, &homes)?;
     sessions.sort_by_key(|session| Reverse(session.modified));
 
-    println!("{:<18} {:<24} SESSION", "HOME", "MODIFIED");
-    for session in sessions.into_iter().take(limit) {
-        println!(
-            "{:<18} {:<24} {}",
-            session.home.label,
-            format_time(session.modified),
-            session_file_id(&session)?.unwrap_or_else(|| session_name(&session.path))
-        );
+    println!("{}", ui::heading("Recent Codex Sessions"));
+    if sessions.is_empty() {
+        println!("No Codex session files found in known homes.");
+        return Ok(());
     }
 
+    let rows = sessions
+        .into_iter()
+        .take(limit)
+        .map(|session| {
+            let cwd = session_file_cwd(&session)?
+                .map(|cwd| util::display_path(&cwd))
+                .unwrap_or_else(|| "-".to_string());
+            let id = session_file_id(&session)?.unwrap_or_else(|| session_name(&session.path));
+            Ok(vec![
+                session.home.label.clone(),
+                format_time(session.modified),
+                id,
+                cwd,
+            ])
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    ui::print_table(&["HOME", "UPDATED", "SESSION", "CWD"], &rows, &[]);
     Ok(())
 }
 

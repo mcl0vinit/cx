@@ -1,7 +1,7 @@
 use crate::{
     config,
     db::{self, Account},
-    limits,
+    limits, ui, util,
 };
 use anyhow::{anyhow, Result};
 use rusqlite::Connection;
@@ -35,20 +35,79 @@ pub fn create(conn: &Connection, name: &str, accounts_csv: &str, strategy: &str)
 
 pub fn list(conn: &Connection) -> Result<()> {
     let pools = db::list_pools(conn)?;
-    println!(
-        "{:<20} {:<16} {:<12} ACCOUNTS",
-        "NAME", "STRATEGY", "FAILOVER"
-    );
+    println!("{}", ui::heading("Pools"));
+    if pools.is_empty() {
+        println!("No pools configured.");
+        println!("Create one with `cx pool create coding --accounts personal,work`.");
+        return Ok(());
+    }
+
+    let mut pool_rows = Vec::new();
+    let mut account_rows = Vec::new();
     for pool in pools {
         let accounts = db::get_pool_accounts(conn, &pool.name)?;
-        println!(
-            "{:<20} {:<16} {:<12} {}",
-            pool.name,
-            pool.strategy,
-            pool.failover,
-            accounts.join(",")
-        );
+        pool_rows.push(vec![
+            pool.name.clone(),
+            pool.strategy.clone(),
+            pool.failover.clone(),
+            accounts.join(", "),
+        ]);
+
+        for (index, account_name) in accounts.iter().enumerate() {
+            match db::get_account(conn, account_name)? {
+                Some(account) => {
+                    let snapshot = limits::latest_snapshot(&account.codex_home)?;
+                    let five = snapshot
+                        .as_ref()
+                        .and_then(|snapshot| snapshot.primary.as_ref());
+                    let weekly = snapshot
+                        .as_ref()
+                        .and_then(|snapshot| snapshot.secondary.as_ref());
+                    let status = if account.disabled {
+                        "disabled".to_string()
+                    } else {
+                        account.status.clone()
+                    };
+                    account_rows.push(vec![
+                        pool.name.clone(),
+                        (index + 1).to_string(),
+                        account.name,
+                        status,
+                        limits::compact_remaining(five),
+                        limits::compact_remaining(weekly),
+                        db::active_session_count(conn, account_name)?.to_string(),
+                        util::display_path(&account.codex_home),
+                    ]);
+                }
+                None => account_rows.push(vec![
+                    pool.name.clone(),
+                    (index + 1).to_string(),
+                    account_name.clone(),
+                    "missing".to_string(),
+                    "-".to_string(),
+                    "-".to_string(),
+                    "-".to_string(),
+                    "-".to_string(),
+                ]),
+            }
+        }
     }
+
+    ui::print_table(
+        &["POOL", "STRATEGY", "FAILOVER", "ACCOUNTS"],
+        &pool_rows,
+        &[],
+    );
+
+    println!();
+    println!("{}", ui::heading("Pool Accounts"));
+    ui::print_table(
+        &[
+            "POOL", "ORDER", "ACCOUNT", "STATUS", "5H LEFT", "WK LEFT", "ACTIVE", "HOME",
+        ],
+        &account_rows,
+        &[1, 6],
+    );
     Ok(())
 }
 

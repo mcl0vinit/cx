@@ -21,6 +21,7 @@ Type "export CX_HOME=$HOME/.cx" Enter
 Type "export CX_CODEX_BIN=/tmp/cx-demo/bin/codex" Enter
 Type "export PATH=/tmp/cx-demo/bin:$PATH" Enter
 Type "export PS1='$ '" Enter
+Type "cd /tmp/cx-demo/repo" Enter
 Type "clear" Enter
 Show
 

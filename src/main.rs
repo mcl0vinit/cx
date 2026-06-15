@@ -11,6 +11,7 @@ mod paths;
 mod pool;
 mod resume;
 mod tmux;
+mod ui;
 mod util;
 
 use anyhow::{anyhow, Context, Result};
@@ -30,98 +31,141 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    #[command(about = "Manage Codex account profiles")]
     Account {
         #[command(subcommand)]
         command: AccountCommand,
     },
+    #[command(about = "Manage account routing pools")]
     Pool {
         #[command(subcommand)]
         command: PoolCommand,
     },
+    #[command(about = "Run Codex under a selected account or pool")]
     Run {
-        #[arg(short, long)]
+        #[arg(short, long, help = "Account profile to use")]
         account: Option<String>,
-        #[arg(short, long)]
+        #[arg(short, long, help = "Pool to route through")]
         pool: Option<String>,
-        #[arg(short = 'C', long)]
+        #[arg(short = 'C', long, help = "Working directory for Codex")]
         cwd: Option<PathBuf>,
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        #[arg(
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            help = "Arguments passed through to Codex"
+        )]
         args: Vec<String>,
     },
+    #[command(about = "Run Codex using limit-aware account selection")]
     Smart {
-        #[arg(short, long)]
+        #[arg(short, long, help = "Pool to route through")]
         pool: Option<String>,
         #[arg(
             long,
             help = "Refresh stale/missing limit snapshots before picking. This may consume usage."
         )]
         refresh: bool,
-        #[arg(short = 'C', long)]
+        #[arg(short = 'C', long, help = "Working directory for Codex")]
         cwd: Option<PathBuf>,
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        #[arg(
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            help = "Arguments passed through to Codex"
+        )]
         args: Vec<String>,
     },
+    #[command(about = "Inspect or initialize cx configuration")]
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    #[command(about = "Generate shell completions")]
     Completion {
+        #[arg(help = "Shell to generate completions for")]
         shell: Shell,
     },
+    #[command(about = "Run and supervise Codex inside tmux")]
     Tmux {
         #[command(subcommand)]
         command: TmuxCommand,
     },
+    #[command(about = "Move a managed tmux session to another account")]
     Migrate {
+        #[arg(help = "Managed session name")]
         name: String,
-        #[arg(short, long)]
+        #[arg(short, long, help = "Target account")]
         account: Option<String>,
-        #[arg(short, long)]
+        #[arg(short, long, help = "Target pool")]
         pool: Option<String>,
     },
+    #[command(about = "Restart a managed tmux session")]
     Restart {
+        #[arg(help = "Managed session name")]
         name: String,
     },
+    #[command(about = "Copy a Codex session into an account home")]
     Adopt {
+        #[arg(help = "Session id or selector")]
         session: String,
-        #[arg(short, long)]
+        #[arg(short, long, help = "Target account")]
         account: String,
     },
+    #[command(about = "Resume Codex after searching all known homes")]
     Resume {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        #[arg(
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            help = "Arguments passed through after `codex resume`"
+        )]
         args: Vec<String>,
     },
+    #[command(about = "Resume the latest session for the current repo")]
     ResumeHere {
-        #[arg(short, long)]
+        #[arg(short, long, help = "Account to resume under")]
         account: Option<String>,
-        #[arg(short, long)]
+        #[arg(short, long, help = "Pool to route through")]
         pool: Option<String>,
         #[arg(long, help = "Choose the target account using limit-aware routing.")]
         smart: bool,
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        #[arg(
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            help = "Arguments passed through after `codex resume`"
+        )]
         args: Vec<String>,
     },
+    #[command(about = "List recent Codex sessions across known homes")]
     Sessions {
-        #[arg(long, default_value_t = 20)]
+        #[arg(long, default_value_t = 20, help = "Maximum sessions to show")]
         limit: usize,
     },
+    #[command(about = "Refresh account health and local limit snapshots")]
     Refresh {
+        #[arg(help = "Account name to refresh")]
         name: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "Refresh every registered account")]
         all: bool,
-        #[arg(short, long)]
+        #[arg(short, long, help = "Refresh accounts in this pool")]
         pool: Option<String>,
         #[arg(long, help = "Only refresh accounts with stale or missing snapshots.")]
         stale: bool,
     },
+    #[command(about = "Show account capacity and managed-session activity")]
     Watch {
-        #[arg(long, default_value_t = 5)]
+        #[arg(
+            long,
+            default_value_t = 5,
+            help = "Seconds between dashboard refreshes"
+        )]
         interval_secs: u64,
         #[arg(long, help = "Print one dashboard frame and exit.")]
         once: bool,
     },
+    #[command(about = "Run diagnostics for local cx setup")]
     Doctor,
+    #[command(about = "Show account and managed-session overview")]
     Status,
+    #[command(about = "Manage the background cx daemon")]
     Daemon {
         #[command(subcommand)]
         command: DaemonCommand,
@@ -130,21 +174,30 @@ enum Commands {
 
 #[derive(Subcommand, Debug)]
 enum AccountCommand {
+    #[command(about = "Register an account profile")]
     Add {
+        #[arg(help = "Account name")]
         name: String,
-        #[arg(long)]
+        #[arg(long, help = "Existing CODEX_HOME path to register")]
         codex_home: Option<PathBuf>,
     },
+    #[command(about = "Log in to Codex for an account")]
     Login {
+        #[arg(help = "Account name")]
         name: String,
     },
+    #[command(about = "Log out of Codex for an account")]
     Logout {
+        #[arg(help = "Account name")]
         name: String,
     },
+    #[command(about = "List registered account profiles")]
     List,
+    #[command(about = "Check account authentication status")]
     Check {
+        #[arg(help = "Account name")]
         name: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "Check every registered account")]
         all: bool,
         #[arg(
             long,
@@ -152,7 +205,9 @@ enum AccountCommand {
         )]
         online: bool,
     },
+    #[command(about = "Show account capacity, identity, and session counts")]
     Status {
+        #[arg(help = "Account name; omit to show every account")]
         name: Option<String>,
         #[arg(
             long,
@@ -160,70 +215,95 @@ enum AccountCommand {
         )]
         online: bool,
     },
+    #[command(about = "Disable an account for routing")]
     Disable {
+        #[arg(help = "Account name")]
         name: String,
-        #[arg(long)]
+        #[arg(long, help = "Reason recorded in account status")]
         reason: Option<String>,
     },
+    #[command(about = "Re-enable an account for routing")]
     Enable {
+        #[arg(help = "Account name")]
         name: String,
     },
 }
 
 #[derive(Subcommand, Debug)]
 enum PoolCommand {
+    #[command(about = "Create or update a routing pool")]
     Create {
+        #[arg(help = "Pool name")]
         name: String,
-        #[arg(long)]
+        #[arg(long, help = "Comma-separated account names in priority order")]
         accounts: String,
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Routing strategy: first-healthy, least-sessions, or limit-aware"
+        )]
         strategy: Option<String>,
     },
+    #[command(about = "List routing pools and account capacity")]
     List,
 }
 
 #[derive(Subcommand, Debug)]
 enum ConfigCommand {
+    #[command(about = "Create the default config file")]
     Init {
-        #[arg(long)]
+        #[arg(long, help = "Overwrite an existing config file")]
         force: bool,
     },
+    #[command(about = "Print the config file path")]
     Path,
+    #[command(about = "Print the active config")]
     Show,
 }
 
 #[derive(Subcommand, Debug)]
 enum TmuxCommand {
+    #[command(about = "Start a managed Codex tmux session")]
     Run {
-        #[arg(short, long)]
+        #[arg(short, long, help = "Account profile to use")]
         account: Option<String>,
-        #[arg(short, long)]
+        #[arg(short, long, help = "Pool to route through")]
         pool: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "Managed session name")]
         name: String,
-        #[arg(short = 'C', long)]
+        #[arg(short = 'C', long, help = "Working directory for Codex")]
         cwd: Option<PathBuf>,
         #[arg(
             long,
             help = "Prompt cx should use when migrating across account homes."
         )]
         resume_prompt: Option<String>,
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        #[arg(
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            help = "Arguments passed through to Codex"
+        )]
         args: Vec<String>,
     },
+    #[command(about = "List managed tmux sessions")]
     List,
+    #[command(about = "Restart a managed tmux session")]
     Restart {
+        #[arg(help = "Managed session name")]
         name: String,
     },
 }
 
 #[derive(Subcommand, Debug)]
 enum DaemonCommand {
+    #[command(about = "Start the background daemon")]
     Start,
+    #[command(about = "Stop the background daemon")]
     Stop,
+    #[command(about = "Show daemon status")]
     Status,
+    #[command(about = "Run the daemon in the foreground")]
     Run {
-        #[arg(long)]
+        #[arg(long, help = "Seconds between daemon ticks")]
         interval_secs: Option<u64>,
     },
 }
@@ -310,10 +390,13 @@ fn handle_account(conn: &Connection, command: AccountCommand) -> Result<()> {
         AccountCommand::List => account::list(conn),
         AccountCommand::Check { name, all, online } => {
             if all {
+                let mut rows = Vec::new();
                 for acc in db::list_accounts(conn)? {
                     let status = account::check(conn, &acc.name, online)?;
-                    println!("{:<20} {}", acc.name, status);
+                    rows.push(vec![acc.name, status]);
                 }
+                println!("{}", ui::heading("Account Checks"));
+                ui::print_table(&["ACCOUNT", "STATUS"], &rows, &[]);
                 Ok(())
             } else {
                 let name = name.ok_or_else(|| anyhow!("provide an account name or --all"))?;
@@ -581,10 +664,8 @@ fn handle_tmux(conn: &Connection, command: TmuxCommand) -> Result<()> {
 }
 
 fn handle_status(conn: &Connection) -> Result<()> {
-    println!("Accounts");
-    account::list(conn)?;
+    account::status_all(conn, false)?;
     println!();
-    println!("Sessions");
     migrate::print_sessions(conn)?;
     Ok(())
 }

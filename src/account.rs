@@ -1,10 +1,9 @@
-use crate::{codex, config, db, limits, paths, resume, util};
+use crate::{codex, config, db, limits, paths, resume, ui, util};
 use anyhow::{anyhow, Context, Result};
 use rusqlite::Connection;
 use serde_json::Value;
 use std::{
     fs,
-    io::IsTerminal,
     path::{Path, PathBuf},
     process::Stdio,
 };
@@ -123,28 +122,61 @@ pub fn logout(conn: &Connection, name: &str) -> Result<()> {
 
 pub fn list(conn: &Connection) -> Result<()> {
     let accounts = db::list_accounts(conn)?;
-    println!(
-        "{:<20} {:<14} {:>8} {:>8} {:<24} {:<36} LAST_ERROR",
-        "NAME", "STATUS", "CODEX", "MANAGED", "LAST_CHECKED", "CODEX_HOME"
+    if accounts.is_empty() {
+        println!("{}", ui::heading("Accounts"));
+        println!("No accounts registered.");
+        return Ok(());
+    }
+
+    let mut errors = Vec::new();
+    let rows = accounts
+        .into_iter()
+        .map(|account| {
+            let managed = db::active_session_count(conn, &account.name)?;
+            let codex_sessions =
+                resume::codex_session_count(conn, &account.name, &account.codex_home)?;
+            let status = if account.disabled {
+                "disabled".to_string()
+            } else {
+                account.status.clone()
+            };
+            if let Some(error) = &account.last_error {
+                errors.push((account.name.clone(), error.clone()));
+            }
+
+            Ok(vec![
+                account.name,
+                status,
+                auth_email(&account.codex_home).unwrap_or_else(|| "-".to_string()),
+                codex_sessions.to_string(),
+                managed.to_string(),
+                util::display_path(&account.codex_home),
+                account.last_checked_at.unwrap_or_else(|| "-".to_string()),
+            ])
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    println!("{}", ui::heading("Accounts"));
+    ui::print_table(
+        &[
+            "ACCOUNT",
+            "STATUS",
+            "EMAIL",
+            "CODEX",
+            "MGD",
+            "HOME",
+            "LAST CHECK",
+        ],
+        &rows,
+        &[3, 4],
     );
-    for account in accounts {
-        let managed = db::active_session_count(conn, &account.name)?;
-        let codex_sessions = resume::codex_session_count(conn, &account.name, &account.codex_home)?;
-        let status = if account.disabled {
-            "disabled".to_string()
-        } else {
-            account.status.clone()
-        };
-        println!(
-            "{:<20} {:<14} {:>8} {:>8} {:<24} {:<36} {}",
-            account.name,
-            status,
-            codex_sessions,
-            managed,
-            account.last_checked_at.unwrap_or_else(|| "-".to_string()),
-            util::display_path(&account.codex_home),
-            account.last_error.unwrap_or_default()
-        );
+
+    if !errors.is_empty() {
+        println!();
+        println!("{}", ui::heading("Account Notes"));
+        for (name, error) in errors {
+            println!("{name}: {error}");
+        }
     }
     Ok(())
 }
@@ -185,8 +217,8 @@ pub fn status(conn: &Connection, name: &str, online: bool) -> Result<()> {
     let codex_sessions = row.codex_sessions.to_string();
     let managed_sessions = row.managed_sessions.to_string();
 
-    println!("{}", heading("Account"));
-    print_key_values(&[
+    println!("{}", ui::heading("Account"));
+    ui::print_key_values(&[
         ("Name", row.name.as_str()),
         ("Status", row.status.as_str()),
         ("Email", row.email.as_str()),
@@ -196,7 +228,7 @@ pub fn status(conn: &Connection, name: &str, online: bool) -> Result<()> {
         ("Last checked", row.last_checked.as_str()),
     ]);
     if let Some(error) = &row.last_error {
-        print_key_values(&[("Last error", error.as_str())]);
+        ui::print_key_values(&[("Last error", error.as_str())]);
     }
     println!();
 
@@ -270,7 +302,7 @@ fn status_row(conn: &Connection, name: &str, online: bool) -> Result<AccountStat
 }
 
 fn print_status_table(rows: &[AccountStatusRow]) {
-    println!("{}", heading("Accounts"));
+    println!("{}", ui::heading("Accounts"));
     let headers = [
         "ACCOUNT", "STATUS", "EMAIL", "CODEX", "MGD", "5H LEFT", "WK LEFT", "5H RESET", "WK RESET",
         "OBSERVED",
@@ -292,7 +324,7 @@ fn print_status_table(rows: &[AccountStatusRow]) {
             ]
         })
         .collect::<Vec<_>>();
-    print_table(&headers, &table_rows, &[3, 4]);
+    ui::print_table(&headers, &table_rows, &[3, 4]);
 
     let errors = rows
         .iter()
@@ -304,73 +336,10 @@ fn print_status_table(rows: &[AccountStatusRow]) {
         .collect::<Vec<_>>();
     if !errors.is_empty() {
         println!();
-        println!("{}", heading("Account Notes"));
+        println!("{}", ui::heading("Account Notes"));
         for (name, error) in errors {
             println!("{name}: {error}");
         }
-    }
-}
-
-fn print_key_values(rows: &[(&str, &str)]) {
-    let width = rows.iter().map(|(key, _)| key.len()).max().unwrap_or(0);
-    for (key, value) in rows {
-        println!("{:<width$}  {}", key, value, width = width);
-    }
-}
-
-fn print_table(headers: &[&str], rows: &[Vec<String>], right_align: &[usize]) {
-    let mut widths = headers
-        .iter()
-        .map(|header| header.len())
-        .collect::<Vec<_>>();
-    for row in rows {
-        for (index, cell) in row.iter().enumerate() {
-            widths[index] = widths[index].max(cell.len());
-        }
-    }
-
-    print_separator(&widths);
-    print_table_row(
-        &headers
-            .iter()
-            .map(|header| (*header).to_string())
-            .collect::<Vec<_>>(),
-        &widths,
-        right_align,
-    );
-    print_separator(&widths);
-    for row in rows {
-        print_table_row(row, &widths, right_align);
-    }
-    print_separator(&widths);
-}
-
-fn print_separator(widths: &[usize]) {
-    print!("+");
-    for width in widths {
-        print!("{}+", "-".repeat(width + 2));
-    }
-    println!();
-}
-
-fn print_table_row(row: &[String], widths: &[usize], right_align: &[usize]) {
-    print!("|");
-    for (index, cell) in row.iter().enumerate() {
-        let width = widths[index];
-        if right_align.contains(&index) {
-            print!(" {:>width$} |", cell, width = width);
-        } else {
-            print!(" {:<width$} |", cell, width = width);
-        }
-    }
-    println!();
-}
-
-fn heading(text: &str) -> String {
-    if std::io::stdout().is_terminal() {
-        format!("\x1b[1m{text}\x1b[0m")
-    } else {
-        text.to_string()
     }
 }
 
@@ -519,10 +488,15 @@ pub fn online_check(conn: &Connection, name: &str) -> Result<String> {
 }
 
 pub fn refresh(conn: &Connection, names: &[String], stale_only: bool) -> Result<()> {
-    for name in names {
-        let outcome = refresh_one(conn, name, stale_only)?;
-        println!("{:<20} {}", name, outcome);
-    }
+    let rows = names
+        .iter()
+        .map(|name| {
+            let outcome = refresh_one(conn, name, stale_only)?;
+            Ok(vec![name.clone(), outcome])
+        })
+        .collect::<Result<Vec<_>>>()?;
+    println!("{}", ui::heading("Refresh"));
+    ui::print_table(&["ACCOUNT", "RESULT"], &rows, &[]);
     Ok(())
 }
 

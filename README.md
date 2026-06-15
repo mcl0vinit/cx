@@ -95,6 +95,7 @@ cx resume <session-id>
 cx personal resume <session-id>
 
 # See account email, limits, and health
+cx status
 cx watch --once
 cx refresh --stale
 cx account status
