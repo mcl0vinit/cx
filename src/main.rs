@@ -89,7 +89,7 @@ enum Commands {
         #[command(subcommand)]
         command: TmuxCommand,
     },
-    #[command(about = "Move a managed tmux session to another account")]
+    #[command(about = "Move a managed tmux session to another account", hide = true)]
     Migrate {
         #[arg(help = "Managed session name")]
         name: String,
@@ -98,7 +98,7 @@ enum Commands {
         #[arg(short, long, help = "Target pool")]
         pool: Option<String>,
     },
-    #[command(about = "Restart a managed tmux session")]
+    #[command(about = "Restart a managed tmux session", hide = true)]
     Restart {
         #[arg(help = "Managed session name")]
         name: String,
@@ -290,6 +290,15 @@ enum TmuxCommand {
     Restart {
         #[arg(help = "Managed session name")]
         name: String,
+    },
+    #[command(about = "Move a managed tmux session to another account")]
+    Migrate {
+        #[arg(help = "Managed session name")]
+        name: String,
+        #[arg(short, long, help = "Target account")]
+        account: Option<String>,
+        #[arg(short, long, help = "Target pool")]
+        pool: Option<String>,
     },
 }
 
@@ -612,14 +621,14 @@ fn handle_tmux(conn: &Connection, command: TmuxCommand) -> Result<()> {
                     .unwrap_or(false);
                 if pane_exists {
                     anyhow::bail!(
-                        "session `{}` already exists in pane {}; run `cx restart {}` or choose a new name",
+                        "session `{}` already exists in pane {}; run `cx tmux restart {}` or choose a new name",
                         name,
                         existing.tmux_pane.unwrap_or_else(|| "-".to_string()),
                         name
                     );
                 }
                 anyhow::bail!(
-                    "session `{}` already exists in the registry; run `cx restart {}` or choose a new name",
+                    "session `{}` already exists in the registry; run `cx tmux restart {}` or choose a new name",
                     name,
                     name
                 );
@@ -660,6 +669,11 @@ fn handle_tmux(conn: &Connection, command: TmuxCommand) -> Result<()> {
         }
         TmuxCommand::List => migrate::print_sessions(conn),
         TmuxCommand::Restart { name } => migrate::restart(conn, &name),
+        TmuxCommand::Migrate {
+            name,
+            account,
+            pool,
+        } => migrate::migrate(conn, &name, account.as_deref(), pool.as_deref()),
     }
 }
 

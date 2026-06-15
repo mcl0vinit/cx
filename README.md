@@ -307,14 +307,13 @@ List and restart:
 ```bash
 cx tmux list
 cx tmux restart atlas
-cx restart atlas
 ```
 
 Migrate a managed session:
 
 ```bash
-cx migrate atlas --account work
-cx migrate atlas --pool coding
+cx tmux migrate atlas --account work
+cx tmux migrate atlas --pool coding
 ```
 
 ## Daemon
@@ -382,6 +381,11 @@ cx completion SHELL
 
 cx pool create NAME --accounts a,b,c [--strategy limit-aware]
 cx pool list
+
+cx tmux run [--account NAME | --pool NAME] --name NAME [-C PATH] -- ARGS...
+cx tmux list
+cx tmux restart NAME
+cx tmux migrate NAME [--account NAME | --pool NAME]
 
 cx run --account NAME -- ARGS...
 cx run --pool NAME -- ARGS...
