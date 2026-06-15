@@ -320,6 +320,15 @@ pub fn print_sessions(conn: &Connection, limit: usize) -> Result<()> {
     Ok(())
 }
 
+pub fn codex_session_count(conn: &Connection, label: &str, home: &Path) -> Result<i64> {
+    let home = SessionHome {
+        label: label.to_string(),
+        path: home.to_path_buf(),
+    };
+    sync_session_index(conn, std::slice::from_ref(&home))?;
+    db::count_indexed_codex_sessions_for_home(conn, &index_home_path(&home))
+}
+
 fn parse_resume_request(args: &[String]) -> Option<ResumeRequest> {
     if args.first().map(|arg| arg.as_str()) != Some("resume") {
         return None;

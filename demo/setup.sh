@@ -95,8 +95,17 @@ CONFIG
 
 for account in personal work overflow; do
   "$cx_bin" account add "$account" >/dev/null
-  printf '{"demo":true}\n' >"$CX_HOME/accounts/$account/auth.json"
 done
+
+cat >"$CX_HOME/accounts/personal/auth.json" <<'JSON'
+{"tokens":{"id_token":"header.eyJlbWFpbCI6InBlcnNvbmFsQGV4YW1wbGUuY29tIn0.signature"}}
+JSON
+cat >"$CX_HOME/accounts/work/auth.json" <<'JSON'
+{"tokens":{"id_token":"header.eyJlbWFpbCI6IndvcmtAZXhhbXBsZS5jb20ifQ.signature"}}
+JSON
+cat >"$CX_HOME/accounts/overflow/auth.json" <<'JSON'
+{"tokens":{"id_token":"header.eyJlbWFpbCI6Im92ZXJmbG93QGV4YW1wbGUuY29tIn0.signature"}}
+JSON
 
 "$cx_bin" account check --all >/dev/null
 "$cx_bin" pool create coding --accounts personal,work,overflow --strategy limit-aware >/dev/null

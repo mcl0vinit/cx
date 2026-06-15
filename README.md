@@ -178,6 +178,8 @@ cx account status personal
 cx watch --once
 ```
 
+In account status tables, `CODEX` is the number of discovered Codex history sessions in that account home. `MGD` is the number of active cx-managed tmux sessions.
+
 Refresh with a small Codex request:
 
 ```bash

@@ -1,12 +1,29 @@
-use crate::{codex, config, db, limits, paths, util};
+use crate::{codex, config, db, limits, paths, resume, util};
 use anyhow::{anyhow, Context, Result};
 use rusqlite::Connection;
 use serde_json::Value;
 use std::{
     fs,
+    io::IsTerminal,
     path::{Path, PathBuf},
     process::Stdio,
 };
+
+struct AccountStatusRow {
+    name: String,
+    status: String,
+    email: String,
+    codex_sessions: i64,
+    managed_sessions: i64,
+    five_hour: String,
+    weekly: String,
+    five_hour_reset: String,
+    weekly_reset: String,
+    observed: String,
+    home: String,
+    last_checked: String,
+    last_error: Option<String>,
+}
 
 pub fn ensure_account_home(path: PathBuf) -> Result<PathBuf> {
     let home = util::expand_tilde(path);
@@ -107,21 +124,23 @@ pub fn logout(conn: &Connection, name: &str) -> Result<()> {
 pub fn list(conn: &Connection) -> Result<()> {
     let accounts = db::list_accounts(conn)?;
     println!(
-        "{:<20} {:<14} {:<8} {:<24} {:<36} LAST_ERROR",
-        "NAME", "STATUS", "ACTIVE", "LAST_CHECKED", "CODEX_HOME"
+        "{:<20} {:<14} {:>8} {:>8} {:<24} {:<36} LAST_ERROR",
+        "NAME", "STATUS", "CODEX", "MANAGED", "LAST_CHECKED", "CODEX_HOME"
     );
     for account in accounts {
-        let active = db::active_session_count(conn, &account.name)?;
+        let managed = db::active_session_count(conn, &account.name)?;
+        let codex_sessions = resume::codex_session_count(conn, &account.name, &account.codex_home)?;
         let status = if account.disabled {
             "disabled".to_string()
         } else {
             account.status.clone()
         };
         println!(
-            "{:<20} {:<14} {:<8} {:<24} {:<36} {}",
+            "{:<20} {:<14} {:>8} {:>8} {:<24} {:<36} {}",
             account.name,
             status,
-            active,
+            codex_sessions,
+            managed,
             account.last_checked_at.unwrap_or_else(|| "-".to_string()),
             util::display_path(&account.codex_home),
             account.last_error.unwrap_or_default()
@@ -162,40 +181,27 @@ pub fn check(conn: &Connection, name: &str, online: bool) -> Result<String> {
 }
 
 pub fn status(conn: &Connection, name: &str, online: bool) -> Result<()> {
-    let check_status = check(conn, name, online)?;
-    let account =
-        db::get_account(conn, name)?.ok_or_else(|| anyhow!("unknown account `{}`", name))?;
-    let active = db::active_session_count(conn, &account.name)?;
-    let status = if account.disabled {
-        "disabled".to_string()
-    } else {
-        check_status
-    };
+    let row = status_row(conn, name, online)?;
+    let codex_sessions = row.codex_sessions.to_string();
+    let managed_sessions = row.managed_sessions.to_string();
 
-    println!("Account");
-    println!("{:<18} {}", "Name", account.name);
-    println!("{:<18} {}", "Status", status);
-    println!(
-        "{:<18} {}",
-        "Email",
-        auth_email(&account.codex_home).unwrap_or_else(|| "-".to_string())
-    );
-    println!("{:<18} {}", "Active sessions", active);
-    println!(
-        "{:<18} {}",
-        "CODEX_HOME",
-        util::display_path(&account.codex_home)
-    );
-    println!(
-        "{:<18} {}",
-        "Last checked",
-        account.last_checked_at.unwrap_or_else(|| "-".to_string())
-    );
-    if let Some(error) = account.last_error {
-        println!("{:<18} {}", "Last error", error);
+    println!("{}", heading("Account"));
+    print_key_values(&[
+        ("Name", row.name.as_str()),
+        ("Status", row.status.as_str()),
+        ("Email", row.email.as_str()),
+        ("Codex sessions", codex_sessions.as_str()),
+        ("Managed active", managed_sessions.as_str()),
+        ("CODEX_HOME", row.home.as_str()),
+        ("Last checked", row.last_checked.as_str()),
+    ]);
+    if let Some(error) = &row.last_error {
+        print_key_values(&[("Last error", error.as_str())]);
     }
     println!();
 
+    let account =
+        db::get_account(conn, name)?.ok_or_else(|| anyhow!("unknown account `{}`", name))?;
     match limits::latest_snapshot(&account.codex_home)? {
         Some(snapshot) => limits::print_snapshot(&snapshot),
         None => {
@@ -218,14 +224,154 @@ pub fn status_all(conn: &Connection, online: bool) -> Result<()> {
         return Ok(());
     }
 
-    for (index, account) in accounts.iter().enumerate() {
-        if index > 0 {
-            println!();
-        }
-        status(conn, &account.name, online)?;
-    }
+    let rows = accounts
+        .iter()
+        .map(|account| status_row(conn, &account.name, online))
+        .collect::<Result<Vec<_>>>()?;
+    print_status_table(&rows);
 
     Ok(())
+}
+
+fn status_row(conn: &Connection, name: &str, online: bool) -> Result<AccountStatusRow> {
+    let check_status = check(conn, name, online)?;
+    let account =
+        db::get_account(conn, name)?.ok_or_else(|| anyhow!("unknown account `{}`", name))?;
+    let managed_sessions = db::active_session_count(conn, &account.name)?;
+    let codex_sessions = resume::codex_session_count(conn, &account.name, &account.codex_home)?;
+    let snapshot = limits::latest_snapshot(&account.codex_home)?;
+    let status = if account.disabled {
+        "disabled".to_string()
+    } else {
+        check_status
+    };
+    let five = snapshot
+        .as_ref()
+        .and_then(|snapshot| snapshot.primary.as_ref());
+    let weekly = snapshot
+        .as_ref()
+        .and_then(|snapshot| snapshot.secondary.as_ref());
+
+    Ok(AccountStatusRow {
+        name: account.name,
+        status,
+        email: auth_email(&account.codex_home).unwrap_or_else(|| "-".to_string()),
+        codex_sessions,
+        managed_sessions,
+        five_hour: limits::compact_used(five),
+        weekly: limits::compact_used(weekly),
+        five_hour_reset: limits::compact_reset(five),
+        weekly_reset: limits::compact_reset(weekly),
+        observed: limits::compact_observed_age(snapshot.as_ref()),
+        home: util::display_path(&account.codex_home),
+        last_checked: account.last_checked_at.unwrap_or_else(|| "-".to_string()),
+        last_error: account.last_error,
+    })
+}
+
+fn print_status_table(rows: &[AccountStatusRow]) {
+    println!("{}", heading("Accounts"));
+    let headers = [
+        "ACCOUNT", "STATUS", "EMAIL", "CODEX", "MGD", "5H", "WEEKLY", "5H RESET", "WK RESET",
+        "OBSERVED",
+    ];
+    let table_rows = rows
+        .iter()
+        .map(|row| {
+            vec![
+                row.name.clone(),
+                row.status.clone(),
+                row.email.clone(),
+                row.codex_sessions.to_string(),
+                row.managed_sessions.to_string(),
+                row.five_hour.clone(),
+                row.weekly.clone(),
+                row.five_hour_reset.clone(),
+                row.weekly_reset.clone(),
+                row.observed.clone(),
+            ]
+        })
+        .collect::<Vec<_>>();
+    print_table(&headers, &table_rows, &[3, 4]);
+
+    let errors = rows
+        .iter()
+        .filter_map(|row| {
+            row.last_error
+                .as_ref()
+                .map(|error| (row.name.as_str(), error))
+        })
+        .collect::<Vec<_>>();
+    if !errors.is_empty() {
+        println!();
+        println!("{}", heading("Account Notes"));
+        for (name, error) in errors {
+            println!("{name}: {error}");
+        }
+    }
+}
+
+fn print_key_values(rows: &[(&str, &str)]) {
+    let width = rows.iter().map(|(key, _)| key.len()).max().unwrap_or(0);
+    for (key, value) in rows {
+        println!("{:<width$}  {}", key, value, width = width);
+    }
+}
+
+fn print_table(headers: &[&str], rows: &[Vec<String>], right_align: &[usize]) {
+    let mut widths = headers
+        .iter()
+        .map(|header| header.len())
+        .collect::<Vec<_>>();
+    for row in rows {
+        for (index, cell) in row.iter().enumerate() {
+            widths[index] = widths[index].max(cell.len());
+        }
+    }
+
+    print_separator(&widths);
+    print_table_row(
+        &headers
+            .iter()
+            .map(|header| (*header).to_string())
+            .collect::<Vec<_>>(),
+        &widths,
+        right_align,
+    );
+    print_separator(&widths);
+    for row in rows {
+        print_table_row(row, &widths, right_align);
+    }
+    print_separator(&widths);
+}
+
+fn print_separator(widths: &[usize]) {
+    print!("+");
+    for width in widths {
+        print!("{}+", "-".repeat(width + 2));
+    }
+    println!();
+}
+
+fn print_table_row(row: &[String], widths: &[usize], right_align: &[usize]) {
+    print!("|");
+    for (index, cell) in row.iter().enumerate() {
+        let width = widths[index];
+        if right_align.contains(&index) {
+            print!(" {:>width$} |", cell, width = width);
+        } else {
+            print!(" {:<width$} |", cell, width = width);
+        }
+    }
+    println!();
+}
+
+fn heading(text: &str) -> String {
+    if std::io::stdout().is_terminal() {
+        format!("\x1b[1m{text}\x1b[0m")
+    } else {
+        text.to_string()
+    }
 }
 
 pub fn local_check(conn: &Connection, name: &str) -> Result<String> {

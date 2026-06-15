@@ -479,6 +479,15 @@ pub fn list_indexed_codex_sessions_for_home(
         .map_err(Into::into)
 }
 
+pub fn count_indexed_codex_sessions_for_home(conn: &Connection, home_path: &Path) -> Result<i64> {
+    let count = conn.query_row(
+        "select count(*) from codex_sessions where home_path = ?1",
+        params![home_path.to_string_lossy().to_string()],
+        |row| row.get(0),
+    )?;
+    Ok(count)
+}
+
 pub fn upsert_indexed_codex_session(
     conn: &Connection,
     session: IndexedCodexSessionUpsert,
