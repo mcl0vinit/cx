@@ -8,6 +8,7 @@ It gives you:
 - smart account selection from latest 5h and weekly limit snapshots
 - resume across Codex homes without remembering where a session lives
 - repo-aware resume with `cx resume-here`
+- install/config diagnostics with `cx doctor`
 - optional tmux supervision for long-running sessions
 
 The core idea is simple:
@@ -47,12 +48,19 @@ Create a pool that chooses the best account from current limits:
 cx pool create coding --accounts personal,work --strategy limit-aware
 ```
 
+Make that pool the default:
+
+```bash
+cx config init
+$EDITOR ~/.cx/config.toml
+```
+
 Run Codex:
 
 ```bash
 cx personal
-cx smart --pool coding
-cx smart --pool coding -- exec "summarize this repo"
+cx smart
+cx smart -- exec "summarize this repo"
 ```
 
 If you already use Codex under `~/.codex`, register that home instead of making a fresh one:
@@ -68,6 +76,7 @@ cx account check personal
 # Pick the best account from all accounts or a pool
 cx smart
 cx smart --pool coding
+cx smart --refresh
 
 # Use a specific account
 cx personal
@@ -85,8 +94,15 @@ cx personal resume <session-id>
 
 # See account limits and health
 cx watch --once
+cx refresh --stale
 cx account status personal
 cx account status personal --online
+
+# Check local setup
+cx doctor
+
+# Generate shell completions
+cx completion zsh > ~/.zfunc/_cx
 ```
 
 Pass Codex arguments after `--` whenever the command has its own `cx` options:
@@ -132,8 +148,9 @@ cx account add personal --codex-home ~/.codex
 `cx` uses this launcher order:
 
 1. `CX_CODEX_BIN`, when set
-2. `$HOME/bin/codex`, when it exists
-3. `codex` on `PATH`
+2. `codex_bin` from `~/.cx/config.toml`, when set
+3. `$HOME/bin/codex`, when it exists
+4. `codex` on `PATH`
 
 This preserves local wrapper behavior, such as default sandbox flags:
 
@@ -164,6 +181,16 @@ cx account status personal --online
 ```
 
 `--online` may consume usage because it runs `codex exec`.
+
+Refresh snapshots explicitly:
+
+```bash
+cx refresh personal
+cx refresh --pool coding --stale
+cx refresh --all --stale
+```
+
+`cx smart --refresh` refreshes stale or missing snapshots before picking an account.
 
 ### Smart Routing
 
@@ -221,6 +248,40 @@ Explicit pre-copy is also available:
 cx personal adopt <session-id>
 ```
 
+Cross-account tmux migration also tries native history first. If `cx` can find a matching repo session, it copies that session into the target account home and respawns with native `codex resume`. If not, it falls back to the semantic resume prompt.
+
+### Config
+
+`cx` reads `~/.cx/config.toml` when present:
+
+```toml
+default_pool = "coding"
+default_strategy = "limit-aware"
+limit_snapshot_max_age_minutes = 30
+
+[smart]
+refresh_before_pick = false
+
+[daemon]
+auto_migrate_auth_failed = true
+auto_migrate_limited = false
+auto_migrate_degraded = false
+```
+
+Commands:
+
+```bash
+cx config init
+cx config path
+cx config show
+
+cx completion bash
+cx completion zsh
+cx completion fish
+```
+
+`CX_CODEX_BIN` still overrides `codex_bin` from config.
+
 ## Optional tmux Mode
 
 Normal `cx` usage does not require tmux. The tmux commands are for managed long-running sessions.
@@ -270,6 +331,28 @@ The daemon currently:
 - auto-migrates sessions away from disabled or auth-failed accounts when a pool has another candidate
 - does not auto-migrate accounts marked `limited`
 
+Daemon migration policy is configured under `[daemon]` in `~/.cx/config.toml`.
+
+## Doctor
+
+Run:
+
+```bash
+cx doctor
+```
+
+It checks:
+
+- config parse status
+- Codex launcher and version
+- account homes and auth files
+- latest limit snapshot freshness
+- default pool
+- SQLite registry location
+- tmux availability
+- daemon pidfile/process status
+- common git hygiene for ignored local files
+
 ## Command Reference
 
 ```bash
@@ -283,12 +366,17 @@ cx account check --all [--online]
 cx account disable NAME [--reason TEXT]
 cx account enable NAME
 
+cx config init [--force]
+cx config path
+cx config show
+cx completion SHELL
+
 cx pool create NAME --accounts a,b,c [--strategy limit-aware]
 cx pool list
 
 cx run --account NAME -- ARGS...
 cx run --pool NAME -- ARGS...
-cx smart [--pool NAME] -- ARGS...
+cx smart [--pool NAME] [--refresh] -- ARGS...
 
 cx sessions [--limit N]
 cx resume <session-id>
@@ -297,7 +385,9 @@ cx resume-here [--account NAME | --pool NAME | --smart]
 cx NAME resume <session-id>
 cx NAME resume-here
 
+cx refresh [NAME] [--all | --pool NAME] [--stale]
 cx watch [--once] [--interval-secs N]
+cx doctor
 cx status
 ```
 
@@ -318,7 +408,6 @@ cargo clippy -- -D warnings
 Obvious next steps:
 
 1. Add a Unix-socket RPC layer so `cx` talks to `cxd` instead of both touching SQLite.
-2. Add config-driven daemon policy.
-3. Add native-history import for cross-account tmux migrations.
-4. Add better process/log inspection to classify account health from Codex stderr.
-5. Add shell completions.
+2. Add release packaging.
+3. Add better process/log inspection to classify account health from Codex stderr.
+4. Add a Unix-socket RPC layer when daemon coordination outgrows direct SQLite.
