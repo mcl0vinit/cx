@@ -1,7 +1,12 @@
 use crate::{codex, config, db, limits, paths, util};
 use anyhow::{anyhow, Context, Result};
 use rusqlite::Connection;
-use std::{fs, path::PathBuf, process::Stdio};
+use serde_json::Value;
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::Stdio,
+};
 
 pub fn ensure_account_home(path: PathBuf) -> Result<PathBuf> {
     let home = util::expand_tilde(path);
@@ -170,6 +175,11 @@ pub fn status(conn: &Connection, name: &str, online: bool) -> Result<()> {
     println!("Account");
     println!("{:<18} {}", "Name", account.name);
     println!("{:<18} {}", "Status", status);
+    println!(
+        "{:<18} {}",
+        "Email",
+        auth_email(&account.codex_home).unwrap_or_else(|| "-".to_string())
+    );
     println!("{:<18} {}", "Active sessions", active);
     println!(
         "{:<18} {}",
@@ -252,6 +262,69 @@ pub fn local_check(conn: &Connection, name: &str) -> Result<String> {
 
     db::set_account_status(conn, name, "healthy", None)?;
     Ok("healthy".to_string())
+}
+
+fn auth_email(codex_home: &Path) -> Option<String> {
+    let text = fs::read_to_string(codex_home.join("auth.json")).ok()?;
+    let value = serde_json::from_str::<Value>(&text).ok()?;
+    let token = value
+        .get("tokens")
+        .and_then(|tokens| tokens.get("id_token"))
+        .and_then(Value::as_str)?;
+    jwt_claim(token, "email")
+}
+
+fn jwt_claim(token: &str, claim: &str) -> Option<String> {
+    let payload = token.split('.').nth(1)?;
+    let bytes = decode_base64_url(payload)?;
+    let value = serde_json::from_slice::<Value>(&bytes).ok()?;
+    value
+        .get(claim)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn decode_base64_url(input: &str) -> Option<Vec<u8>> {
+    let mut output = Vec::with_capacity(input.len() * 3 / 4);
+    let mut buffer = 0u32;
+    let mut bits = 0u8;
+
+    for byte in input.bytes().filter(|byte| *byte != b'=') {
+        let value = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'-' => 62,
+            b'_' => 63,
+            _ => return None,
+        } as u32;
+
+        buffer = (buffer << 6) | value;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            output.push((buffer >> bits) as u8);
+            buffer &= (1 << bits) - 1;
+        }
+    }
+
+    Some(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn jwt_claim_reads_email_from_payload() {
+        let token = "header.eyJlbWFpbCI6InNhbUBleGFtcGxlLmNvbSJ9.signature";
+        assert_eq!(
+            jwt_claim(token, "email").as_deref(),
+            Some("sam@example.com")
+        );
+    }
 }
 
 pub fn online_check(conn: &Connection, name: &str) -> Result<String> {

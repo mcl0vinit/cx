@@ -94,7 +94,7 @@ cx sessions
 cx resume <session-id>
 cx personal resume <session-id>
 
-# See account limits and health
+# See account email, limits, and health
 cx watch --once
 cx refresh --stale
 cx account status
@@ -228,6 +228,8 @@ Top-level resume uses the home that already owns the session:
 cx resume <session-id>
 cx resume --last
 ```
+
+`cx` keeps a local SQLite index of discovered Codex session ids and repo cwd metadata. The first scan of a large `~/.codex/sessions` tree may take a moment; later resume and repo-aware lookups reuse the index and only parse new or changed session files.
 
 Account-scoped resume copies the session into that account home first when needed:
 

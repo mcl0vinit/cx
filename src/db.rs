@@ -2,7 +2,10 @@ use crate::{paths, util};
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+};
 
 #[derive(Debug, Clone)]
 pub struct Account {
@@ -50,6 +53,28 @@ pub struct NewSession {
     pub codex_args: Vec<String>,
     pub resume_prompt: Option<String>,
     pub status: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct IndexedCodexSession {
+    pub path: PathBuf,
+    pub home_path: PathBuf,
+    pub home_label: String,
+    pub session_id: Option<String>,
+    pub cwd: Option<PathBuf>,
+    pub modified_nanos: i64,
+    pub size_bytes: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct IndexedCodexSessionUpsert {
+    pub path: PathBuf,
+    pub home_path: PathBuf,
+    pub home_label: String,
+    pub session_id: Option<String>,
+    pub cwd: Option<PathBuf>,
+    pub modified_nanos: i64,
+    pub size_bytes: i64,
 }
 
 pub fn connect() -> Result<Connection> {
@@ -110,6 +135,26 @@ pub fn init(conn: &Connection) -> Result<()> {
           message text,
           created_at text not null
         );
+
+        create table if not exists codex_sessions (
+          path text primary key,
+          home_path text not null,
+          home_label text not null,
+          session_id text,
+          cwd text,
+          modified_nanos integer not null,
+          size_bytes integer not null,
+          indexed_at text not null
+        );
+
+        create index if not exists idx_codex_sessions_home
+          on codex_sessions(home_path);
+
+        create index if not exists idx_codex_sessions_session_id
+          on codex_sessions(session_id);
+
+        create index if not exists idx_codex_sessions_modified
+          on codex_sessions(modified_nanos);
         "#,
     )?;
     Ok(())
@@ -386,4 +431,102 @@ pub fn log_event(conn: &Connection, kind: &str, target: Option<&str>, message: &
         params![kind, target, message, util::now()],
     )?;
     Ok(())
+}
+
+pub fn list_indexed_codex_sessions_for_homes(
+    conn: &Connection,
+    home_paths: &[PathBuf],
+) -> Result<Vec<IndexedCodexSession>> {
+    let wanted = home_paths
+        .iter()
+        .map(|path| path.to_string_lossy().to_string())
+        .collect::<HashSet<_>>();
+    if wanted.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut stmt = conn.prepare(
+        r#"
+        select path, home_path, home_label, session_id, cwd, modified_nanos, size_bytes
+        from codex_sessions
+        "#,
+    )?;
+    let rows = stmt.query_map([], row_to_indexed_codex_session)?;
+    let sessions = rows
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|session| wanted.contains(&session.home_path.to_string_lossy().to_string()))
+        .collect();
+    Ok(sessions)
+}
+
+pub fn list_indexed_codex_sessions_for_home(
+    conn: &Connection,
+    home_path: &Path,
+) -> Result<Vec<IndexedCodexSession>> {
+    let mut stmt = conn.prepare(
+        r#"
+        select path, home_path, home_label, session_id, cwd, modified_nanos, size_bytes
+        from codex_sessions
+        where home_path = ?1
+        "#,
+    )?;
+    let rows = stmt.query_map(
+        params![home_path.to_string_lossy().to_string()],
+        row_to_indexed_codex_session,
+    )?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+pub fn upsert_indexed_codex_session(
+    conn: &Connection,
+    session: IndexedCodexSessionUpsert,
+) -> Result<()> {
+    conn.execute(
+        r#"
+        insert into codex_sessions (
+          path, home_path, home_label, session_id, cwd, modified_nanos, size_bytes, indexed_at
+        ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        on conflict(path) do update set
+          home_path = excluded.home_path,
+          home_label = excluded.home_label,
+          session_id = excluded.session_id,
+          cwd = excluded.cwd,
+          modified_nanos = excluded.modified_nanos,
+          size_bytes = excluded.size_bytes,
+          indexed_at = excluded.indexed_at
+        "#,
+        params![
+            session.path.to_string_lossy().to_string(),
+            session.home_path.to_string_lossy().to_string(),
+            session.home_label,
+            session.session_id,
+            session.cwd.map(|cwd| cwd.to_string_lossy().to_string()),
+            session.modified_nanos,
+            session.size_bytes,
+            util::now(),
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn delete_indexed_codex_session(conn: &Connection, path: &Path) -> Result<()> {
+    conn.execute(
+        "delete from codex_sessions where path = ?1",
+        params![path.to_string_lossy().to_string()],
+    )?;
+    Ok(())
+}
+
+fn row_to_indexed_codex_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<IndexedCodexSession> {
+    Ok(IndexedCodexSession {
+        path: PathBuf::from(row.get::<_, String>(0)?),
+        home_path: PathBuf::from(row.get::<_, String>(1)?),
+        home_label: row.get(2)?,
+        session_id: row.get(3)?,
+        cwd: row.get::<_, Option<String>>(4)?.map(PathBuf::from),
+        modified_nanos: row.get(5)?,
+        size_bytes: row.get(6)?,
+    })
 }

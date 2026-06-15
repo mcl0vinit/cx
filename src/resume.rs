@@ -4,12 +4,12 @@ use chrono::{DateTime, Utc};
 use rusqlite::Connection;
 use std::{
     cmp::Reverse,
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     io::{self, BufRead, BufReader, Read},
     path::{Path, PathBuf},
     process::Command,
-    time::SystemTime,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 const FILE_COMPARE_BUFFER_SIZE: usize = 1024 * 1024;
@@ -44,6 +44,31 @@ struct SessionFile {
     home: SessionHome,
     path: PathBuf,
     modified: SystemTime,
+    id: Option<String>,
+    cwd: Option<PathBuf>,
+}
+
+impl SessionFile {
+    fn from_adopted_target(home: SessionHome, path: PathBuf) -> Self {
+        let metadata = fs::metadata(&path).ok();
+        let modified = metadata
+            .as_ref()
+            .and_then(|metadata| metadata.modified().ok())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        let meta = session_meta(&path).unwrap_or(SessionMeta {
+            id: None,
+            cwd: None,
+        });
+        let id = meta.id.or_else(|| uuid_suffix_from_path(&path));
+
+        Self {
+            home,
+            path,
+            modified,
+            id,
+            cwd: meta.cwd,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -63,16 +88,16 @@ pub fn resolve_invocation(
 
     let homes = session_homes(conn, preferred_home)?;
     let session = match &request {
-        ResumeRequest::Last => latest_session(&homes)?
+        ResumeRequest::Last => latest_session(conn, &homes)?
             .ok_or_else(|| anyhow!("no Codex sessions found in known homes"))?,
-        ResumeRequest::Selector(selector) => find_session(&homes, selector)?
+        ResumeRequest::Selector(selector) => find_session(conn, &homes, selector)?
             .ok_or_else(|| anyhow!("session `{}` was not found in known Codex homes", selector))?,
     };
     Ok(Some(resolved_invocation(
         session.home.path.clone(),
         args,
         &request,
-        &session.path,
+        &session,
     )?))
 }
 
@@ -92,8 +117,8 @@ pub fn resolve_account_invocation(
     };
     let selected_homes = vec![selected_home.clone()];
     let selected_session = match &request {
-        ResumeRequest::Last => latest_session(&selected_homes)?,
-        ResumeRequest::Selector(selector) => find_session(&selected_homes, selector)?,
+        ResumeRequest::Last => latest_session(conn, &selected_homes)?,
+        ResumeRequest::Selector(selector) => find_session(conn, &selected_homes, selector)?,
     };
 
     if let Some(session) = selected_session {
@@ -101,30 +126,30 @@ pub fn resolve_account_invocation(
             selected_home.path,
             args,
             &request,
-            &session.path,
+            &session,
         )?));
     }
 
     let source = match &request {
         ResumeRequest::Last => {
             let homes = session_homes(conn, Some(account_home))?;
-            latest_session(&homes)?
+            latest_session(conn, &homes)?
                 .ok_or_else(|| anyhow!("no Codex sessions found in known homes"))?
         }
         ResumeRequest::Selector(selector) => {
             let homes = session_homes(conn, Some(account_home))?;
-            find_session(&homes, selector)?.ok_or_else(|| {
+            find_session(conn, &homes, selector)?.ok_or_else(|| {
                 anyhow!("session `{}` was not found in known Codex homes", selector)
             })?
         }
     };
 
-    let adopted = adopt_session_file(account_name, &selected_home, source)?;
+    let adopted = adopt_session_file(conn, account_name, &selected_home, source)?;
     Ok(Some(resolved_invocation(
-        selected_home.path,
+        selected_home.path.clone(),
         args,
         &request,
-        &adopted.target,
+        &SessionFile::from_adopted_target(selected_home, adopted.target),
     )?))
 }
 
@@ -138,8 +163,8 @@ pub fn adopt_session(
         path: target_account.codex_home.clone(),
     };
 
-    if let Some(existing) = find_session(std::slice::from_ref(&target_home), selector)? {
-        let id = session_id(&existing.path)?
+    if let Some(existing) = find_session(conn, std::slice::from_ref(&target_home), selector)? {
+        let id = session_file_id(&existing)?
             .ok_or_else(|| anyhow!("could not read session id from {}", existing.path.display()))?;
         return Ok(AdoptionResult {
             session_id: id,
@@ -150,10 +175,10 @@ pub fn adopt_session(
     }
 
     let homes = session_homes(conn, Some(&target_account.codex_home))?;
-    let source = find_session(&homes, selector)?
+    let source = find_session(conn, &homes, selector)?
         .ok_or_else(|| anyhow!("session `{}` was not found in known Codex homes", selector))?;
 
-    adopt_session_file(&target_account.name, &target_home, source)
+    adopt_session_file(conn, &target_account.name, &target_home, source)
 }
 
 pub fn resolve_here_invocation(
@@ -180,7 +205,7 @@ fn resolve_here_in_root(
         Some((_, account_home)) => session_homes(conn, Some(account_home))?,
         None => session_homes(conn, None)?,
     };
-    let source = latest_session_for_repo(&homes, repo_root)?.ok_or_else(|| {
+    let source = latest_session_for_repo(conn, &homes, repo_root)?.ok_or_else(|| {
         anyhow!(
             "no Codex sessions found for repo {} in known homes",
             repo_root.display()
@@ -192,26 +217,28 @@ fn resolve_here_in_root(
             label: account_name.to_string(),
             path: account_home.to_path_buf(),
         };
-        let session_path = if same_path(&source.home.path, account_home) {
-            source.path
+        let session = if same_path(&source.home.path, account_home) {
+            source
         } else {
-            adopt_session_file(account_name, &selected_home, source)?.target
+            let adopted = adopt_session_file(conn, account_name, &selected_home, source)?;
+            SessionFile::from_adopted_target(selected_home.clone(), adopted.target)
         };
-        return resolved_invocation(selected_home.path, &args, &request, &session_path);
+        return resolved_invocation(selected_home.path, &args, &request, &session);
     }
 
-    resolved_invocation(source.home.path.clone(), &args, &request, &source.path)
+    resolved_invocation(source.home.path.clone(), &args, &request, &source)
 }
 
 fn adopt_session_file(
+    conn: &Connection,
     target_account_name: &str,
     target_home: &SessionHome,
     source: SessionFile,
 ) -> Result<AdoptionResult> {
-    let id = session_id(&source.path)?
+    let id = session_file_id(&source)?
         .ok_or_else(|| anyhow!("could not read session id from {}", source.path.display()))?;
 
-    let target_matches = sessions_with_id(target_home, &id)?;
+    let target_matches = sessions_with_id(conn, target_home, &id)?;
     match target_matches.as_slice() {
         [] => {}
         [existing] => {
@@ -277,7 +304,7 @@ pub fn default_resume_home(conn: &Connection, preferred_home: Option<&Path>) -> 
 
 pub fn print_sessions(conn: &Connection, limit: usize) -> Result<()> {
     let homes = session_homes(conn, None)?;
-    let mut sessions = all_sessions(&homes)?;
+    let mut sessions = all_sessions(conn, &homes)?;
     sessions.sort_by_key(|session| Reverse(session.modified));
 
     println!("{:<18} {:<24} SESSION", "HOME", "MODIFIED");
@@ -286,7 +313,7 @@ pub fn print_sessions(conn: &Connection, limit: usize) -> Result<()> {
             "{:<18} {:<24} {}",
             session.home.label,
             format_time(session.modified),
-            session_id(&session.path)?.unwrap_or_else(|| session_name(&session.path))
+            session_file_id(&session)?.unwrap_or_else(|| session_name(&session.path))
         );
     }
 
@@ -320,15 +347,15 @@ fn resolved_invocation(
     home: PathBuf,
     args: &[String],
     request: &ResumeRequest,
-    session_path: &Path,
+    session: &SessionFile,
 ) -> Result<ResolvedInvocation> {
-    let id = session_id(session_path)?
-        .ok_or_else(|| anyhow!("could not read session id from {}", session_path.display()))?;
+    let id = session_file_id(session)?
+        .ok_or_else(|| anyhow!("could not read session id from {}", session.path.display()))?;
 
     Ok(ResolvedInvocation {
         home,
         args: rewrite_resume_args(args, request, &id),
-        cwd: session_cwd(session_path)?,
+        cwd: session_file_cwd(session)?,
     })
 }
 
@@ -438,16 +465,22 @@ fn push_home(
     }
 }
 
-fn latest_session(homes: &[SessionHome]) -> Result<Option<SessionFile>> {
-    Ok(all_sessions(homes)?.into_iter().max_by_key(|s| s.modified))
+fn latest_session(conn: &Connection, homes: &[SessionHome]) -> Result<Option<SessionFile>> {
+    Ok(all_sessions(conn, homes)?
+        .into_iter()
+        .max_by_key(|s| s.modified))
 }
 
-fn latest_session_for_repo(homes: &[SessionHome], repo_root: &Path) -> Result<Option<SessionFile>> {
+fn latest_session_for_repo(
+    conn: &Connection,
+    homes: &[SessionHome],
+    repo_root: &Path,
+) -> Result<Option<SessionFile>> {
     let repo_root = normalize_path(repo_root);
     let mut matches = Vec::new();
 
-    for session in all_sessions(homes)? {
-        let Some(cwd) = session_cwd(&session.path)? else {
+    for session in all_sessions(conn, homes)? {
+        let Some(cwd) = session_file_cwd(&session)? else {
             continue;
         };
         if cwd_matches_repo(&cwd, &repo_root) {
@@ -458,9 +491,13 @@ fn latest_session_for_repo(homes: &[SessionHome], repo_root: &Path) -> Result<Op
     Ok(matches.into_iter().max_by_key(|session| session.modified))
 }
 
-fn find_session(homes: &[SessionHome], selector: &str) -> Result<Option<SessionFile>> {
+fn find_session(
+    conn: &Connection,
+    homes: &[SessionHome],
+    selector: &str,
+) -> Result<Option<SessionFile>> {
     let mut matches = Vec::new();
-    for session in all_sessions(homes)? {
+    for session in all_sessions(conn, homes)? {
         if let Some(score) = match_score(&session.path, selector) {
             matches.push((score, session));
         }
@@ -493,22 +530,125 @@ fn find_session(homes: &[SessionHome], selector: &str) -> Result<Option<SessionF
     Ok(Some(best))
 }
 
-fn sessions_with_id(home: &SessionHome, id: &str) -> Result<Vec<SessionFile>> {
+fn sessions_with_id(conn: &Connection, home: &SessionHome, id: &str) -> Result<Vec<SessionFile>> {
     let mut matches = Vec::new();
-    for session in all_sessions(std::slice::from_ref(home))? {
-        if session_id(&session.path)?.as_deref() == Some(id) {
+    for session in all_sessions(conn, std::slice::from_ref(home))? {
+        if session_file_id(&session)?.as_deref() == Some(id) {
             matches.push(session);
         }
     }
     Ok(matches)
 }
 
-fn all_sessions(homes: &[SessionHome]) -> Result<Vec<SessionFile>> {
-    let mut sessions = Vec::new();
-    for home in homes {
-        collect_sessions(home, &home.path.join("sessions"), &mut sessions)?;
-    }
+fn all_sessions(conn: &Connection, homes: &[SessionHome]) -> Result<Vec<SessionFile>> {
+    sync_session_index(conn, homes)?;
+    let home_paths = homes.iter().map(index_home_path).collect::<Vec<_>>();
+    let sessions = db::list_indexed_codex_sessions_for_homes(conn, &home_paths)?
+        .into_iter()
+        .filter_map(|indexed| {
+            homes
+                .iter()
+                .find(|home| index_home_path(home) == indexed.home_path)
+                .map(|home| SessionFile {
+                    home: home.clone(),
+                    path: indexed.path,
+                    modified: system_time_from_nanos(indexed.modified_nanos),
+                    id: indexed.session_id,
+                    cwd: indexed.cwd,
+                })
+        })
+        .collect::<Vec<_>>();
     Ok(sessions)
+}
+
+fn sync_session_index(conn: &Connection, homes: &[SessionHome]) -> Result<()> {
+    for home in homes {
+        sync_home_session_index(conn, home)?;
+    }
+    Ok(())
+}
+
+fn sync_home_session_index(conn: &Connection, home: &SessionHome) -> Result<()> {
+    let home_path = index_home_path(home);
+    let mut seen = HashSet::new();
+    let mut paths = Vec::new();
+    collect_session_paths(&home.path.join("sessions"), &mut paths)?;
+    let indexed_by_path = db::list_indexed_codex_sessions_for_home(conn, &home_path)?
+        .into_iter()
+        .map(|session| (session.path.clone(), session))
+        .collect::<HashMap<_, _>>();
+
+    conn.execute_batch("begin immediate")?;
+    let result =
+        sync_home_session_index_rows(conn, home, &home_path, paths, &mut seen, &indexed_by_path);
+    match result {
+        Ok(()) => {
+            conn.execute_batch("commit")?;
+            Ok(())
+        }
+        Err(error) => {
+            let _ = conn.execute_batch("rollback");
+            Err(error)
+        }
+    }
+}
+
+fn sync_home_session_index_rows(
+    conn: &Connection,
+    home: &SessionHome,
+    home_path: &Path,
+    paths: Vec<PathBuf>,
+    seen: &mut HashSet<PathBuf>,
+    indexed_by_path: &HashMap<PathBuf, db::IndexedCodexSession>,
+) -> Result<()> {
+    for path in paths {
+        seen.insert(path.clone());
+        let metadata = match fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(_) => {
+                db::delete_indexed_codex_session(conn, &path)?;
+                continue;
+            }
+        };
+        let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+        let modified_nanos = system_time_nanos(modified);
+        let size_bytes = metadata.len() as i64;
+
+        let unchanged = indexed_by_path.get(&path).is_some_and(|indexed| {
+            indexed.home_path == home_path
+                && indexed.home_label == home.label
+                && indexed.modified_nanos == modified_nanos
+                && indexed.size_bytes == size_bytes
+        });
+        if unchanged {
+            continue;
+        }
+
+        let meta = session_meta(&path).unwrap_or(SessionMeta {
+            id: None,
+            cwd: None,
+        });
+        db::upsert_indexed_codex_session(
+            conn,
+            db::IndexedCodexSessionUpsert {
+                path: path.clone(),
+                home_path: home_path.to_path_buf(),
+                home_label: home.label.clone(),
+                session_id: meta.id.or_else(|| uuid_suffix_from_path(&path)),
+                cwd: meta.cwd,
+                modified_nanos,
+                size_bytes,
+            },
+        )?;
+    }
+
+    for indexed_path in indexed_by_path.keys() {
+        if !seen.contains(indexed_path) {
+            db::delete_indexed_codex_session(conn, indexed_path)?;
+        }
+    }
+
+    Ok(())
 }
 
 fn repo_root_for(cwd: &Path) -> Result<PathBuf> {
@@ -544,7 +684,22 @@ fn same_path(left: &Path, right: &Path) -> bool {
     normalize_path(left) == normalize_path(right)
 }
 
-fn collect_sessions(home: &SessionHome, dir: &Path, sessions: &mut Vec<SessionFile>) -> Result<()> {
+fn index_home_path(home: &SessionHome) -> PathBuf {
+    normalize_path(&home.path)
+}
+
+fn system_time_nanos(time: SystemTime) -> i64 {
+    time.duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_nanos()
+        .min(i64::MAX as u128) as i64
+}
+
+fn system_time_from_nanos(nanos: i64) -> SystemTime {
+    UNIX_EPOCH + Duration::from_nanos(nanos.max(0) as u64)
+}
+
+fn collect_session_paths(dir: &Path, sessions: &mut Vec<PathBuf>) -> Result<()> {
     let Ok(entries) = fs::read_dir(dir) else {
         return Ok(());
     };
@@ -552,7 +707,7 @@ fn collect_sessions(home: &SessionHome, dir: &Path, sessions: &mut Vec<SessionFi
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            collect_sessions(home, &path, sessions)?;
+            collect_session_paths(&path, sessions)?;
             continue;
         }
 
@@ -560,15 +715,7 @@ fn collect_sessions(home: &SessionHome, dir: &Path, sessions: &mut Vec<SessionFi
             continue;
         }
 
-        let modified = entry
-            .metadata()
-            .and_then(|metadata| metadata.modified())
-            .unwrap_or(SystemTime::UNIX_EPOCH);
-        sessions.push(SessionFile {
-            home: home.clone(),
-            path,
-            modified,
-        });
+        sessions.push(path);
     }
 
     Ok(())
@@ -696,6 +843,20 @@ fn session_name(path: &Path) -> String {
         .and_then(|name| name.to_str())
         .unwrap_or("<unknown>")
         .to_string()
+}
+
+fn session_file_id(session: &SessionFile) -> Result<Option<String>> {
+    if session.id.is_some() {
+        return Ok(session.id.clone());
+    }
+    session_id(&session.path)
+}
+
+fn session_file_cwd(session: &SessionFile) -> Result<Option<PathBuf>> {
+    if session.cwd.is_some() {
+        return Ok(session.cwd.clone());
+    }
+    session_cwd(&session.path)
 }
 
 fn session_id(path: &Path) -> Result<Option<String>> {
