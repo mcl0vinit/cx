@@ -266,6 +266,20 @@ pub fn adopt_session(
     if let Some(existing) = find_session(conn, std::slice::from_ref(&target_home), selector)? {
         let id = session_file_id(&existing)?
             .ok_or_else(|| anyhow!("could not read session id from {}", existing.path.display()))?;
+        let target_matches = sessions_with_id(conn, &target_home, &id)?;
+        if target_matches.len() > 1 {
+            let paths = target_matches
+                .iter()
+                .map(|session| session.path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::bail!(
+                "target account `{}` has multiple copies of session `{}`: {}",
+                target_account.name,
+                id,
+                paths
+            );
+        }
         return Ok(AdoptionResult {
             session_id: id,
             source: existing.path.clone(),
@@ -954,7 +968,6 @@ fn find_session(
     let same_score = matches
         .iter()
         .filter(|(score, _)| *score == best_score)
-        .take(6)
         .collect::<Vec<_>>();
     if same_score.len() > 1 {
         let mut ids = HashSet::new();
@@ -964,20 +977,6 @@ fn find_session(
             }
         }
         if ids.len() == 1 {
-            let unique_homes = same_score
-                .iter()
-                .map(|(_, session)| index_home_path(&session.home))
-                .collect::<HashSet<_>>();
-            if unique_homes.len() != same_score.len() {
-                let options = same_score
-                    .iter()
-                    .map(|(_, session)| {
-                        format!("{}:{}", session.home.label, session_name(&session.path))
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                anyhow::bail!("session selector `{}` is ambiguous: {}", selector, options);
-            }
             let best = same_score
                 .into_iter()
                 .map(|(_, session)| session.clone())
@@ -988,6 +987,7 @@ fn find_session(
 
         let options = same_score
             .iter()
+            .take(6)
             .map(|(_, session)| format!("{}:{}", session.home.label, session_name(&session.path)))
             .collect::<Vec<_>>()
             .join(", ");
@@ -1741,6 +1741,29 @@ mod tests {
         assert!(attached.exists());
         assert!(files_equal(&newer_file, &attached).unwrap());
         assert!(!files_equal(&older_file, &attached).unwrap());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn find_session_uses_newest_duplicate_with_same_id() {
+        let root = temp_root("newest-same-home-duplicate");
+        let home_path = root.join("home");
+        let id = "11111111-2222-3333-4444-bbbbbbbbbbbb";
+        let older_file = write_session(&home_path, id, Path::new("/tmp/project"), "older");
+        let newer_file = write_session(&home_path, id, Path::new("/tmp/project"), "newer");
+        append_session_line(&newer_file, "\n{\"type\":\"event_msg\"}\n");
+        let conn = Connection::open_in_memory().unwrap();
+        db::init(&conn).unwrap();
+        let home = SessionHome {
+            label: "home".to_string(),
+            path: home_path,
+        };
+
+        let found = find_session(&conn, &[home], id).unwrap().unwrap();
+
+        assert_eq!(found.path, newer_file);
+        assert_ne!(found.path, older_file);
 
         let _ = fs::remove_dir_all(root);
     }
