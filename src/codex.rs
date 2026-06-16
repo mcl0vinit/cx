@@ -27,10 +27,6 @@ pub fn command() -> Command {
     Command::new(bin_path())
 }
 
-pub fn args_with_default_effort(args: &[String]) -> Vec<String> {
-    args_with_model_defaults(args, None, Some("medium"))
-}
-
 pub fn args_with_model_defaults(
     args: &[String],
     model: Option<&str>,
@@ -53,13 +49,12 @@ pub fn args_with_model_defaults(
 }
 
 pub fn shell_command(account_home: &Path, args: &[String]) -> String {
-    let args = args_with_default_effort(args);
     let mut command = format!(
         "CODEX_HOME={} {}",
         util::quote_path(account_home),
         util::quote_path(&bin_path())
     );
-    for arg in &args {
+    for arg in args {
         command.push(' ');
         command.push_str(&util::quote(arg));
     }
@@ -157,5 +152,14 @@ mod tests {
             args_with_model_defaults(&args, None, Some("default")),
             vec!["-c", "model_reasoning_effort=\"medium\"", "resume", "id"]
         );
+    }
+
+    #[test]
+    fn shell_command_uses_original_args() {
+        let args = vec!["exec".to_string(), "hi".to_string()];
+        let command = shell_command(Path::new("/tmp/codex-home"), &args);
+
+        assert!(command.contains(" exec hi"));
+        assert!(!command.contains("model_reasoning_effort"));
     }
 }

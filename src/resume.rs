@@ -779,10 +779,7 @@ fn resolved_invocation(
     let args = codex::args_with_model_defaults(
         &args,
         model.as_ref().map(|model| model.model.as_str()),
-        model
-            .as_ref()
-            .and_then(|model| model.effort.as_deref())
-            .or(Some("medium")),
+        model.as_ref().and_then(|model| model.effort.as_deref()),
     );
 
     Ok(ResolvedInvocation {
@@ -1596,16 +1593,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(resolved.home, target_home);
-        assert_eq!(
-            resolved.args,
-            vec![
-                "-c",
-                "model_reasoning_effort=\"medium\"",
-                "resume",
-                id,
-                "--no-alt-screen"
-            ]
-        );
+        assert_eq!(resolved.args, vec!["resume", id, "--no-alt-screen"]);
         assert_eq!(resolved.cwd, Some(PathBuf::from("/tmp/project")));
         assert!(source_file.exists());
         assert!(resolved
@@ -1637,10 +1625,7 @@ mod tests {
             resolve_here_in_root(&conn, Some(("target", &target_home)), &repo_root, &[]).unwrap();
 
         assert_eq!(resolved.home, target_home);
-        assert_eq!(
-            resolved.args,
-            vec!["-c", "model_reasoning_effort=\"medium\"", "resume", id]
-        );
+        assert_eq!(resolved.args, vec!["resume", id]);
         assert_eq!(resolved.cwd, Some(repo_child));
         assert!(source_file.exists());
         assert!(resolved

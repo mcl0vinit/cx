@@ -940,10 +940,9 @@ fn run_codex_direct(
     cwd: Option<PathBuf>,
     args: &[String],
 ) -> Result<()> {
-    let args = codex::args_with_default_effort(args);
     let mut cmd = codex::command();
     cmd.env("CODEX_HOME", account_home)
-        .args(&args)
+        .args(args)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
