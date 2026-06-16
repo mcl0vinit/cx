@@ -914,6 +914,7 @@ fn stale_lock(path: &Path) -> Result<bool> {
     let status = std::process::Command::new("kill")
         .arg("-0")
         .arg(pid.to_string())
+        .stderr(Stdio::null())
         .status();
     match status {
         Ok(status) => Ok(!status.success()),
