@@ -1,4 +1,4 @@
-use crate::{db, paths, ui, util};
+use crate::{codex, db, paths, ui, util};
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::Connection;
@@ -65,6 +65,11 @@ pub struct AdoptionResult {
 struct SessionMeta {
     id: Option<String>,
     cwd: Option<PathBuf>,
+}
+
+struct SessionModel {
+    model: String,
+    effort: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -261,6 +266,20 @@ pub fn adopt_session(
     if let Some(existing) = find_session(conn, std::slice::from_ref(&target_home), selector)? {
         let id = session_file_id(&existing)?
             .ok_or_else(|| anyhow!("could not read session id from {}", existing.path.display()))?;
+        let target_matches = sessions_with_id(conn, &target_home, &id)?;
+        if target_matches.len() > 1 {
+            let paths = target_matches
+                .iter()
+                .map(|session| session.path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::bail!(
+                "target account `{}` has multiple copies of session `{}`: {}",
+                target_account.name,
+                id,
+                paths
+            );
+        }
         return Ok(AdoptionResult {
             session_id: id,
             source: existing.path.clone(),
@@ -769,9 +788,17 @@ fn resolved_invocation(
     let id = session_file_id(session)?
         .ok_or_else(|| anyhow!("could not read session id from {}", session.path.display()))?;
 
+    let model = session_file_model(session)?;
+    let args = rewrite_resume_args(args, request, &id);
+    let args = codex::args_with_model_defaults(
+        &args,
+        model.as_ref().map(|model| model.model.as_str()),
+        model.as_ref().and_then(|model| model.effort.as_deref()),
+    );
+
     Ok(ResolvedInvocation {
         home,
-        args: rewrite_resume_args(args, request, &id),
+        args,
         cwd: session_file_cwd(session)?,
         session_id: Some(id.clone()),
         summary: summary.map(|summary| ResumeSummary {
@@ -941,7 +968,6 @@ fn find_session(
     let same_score = matches
         .iter()
         .filter(|(score, _)| *score == best_score)
-        .take(6)
         .collect::<Vec<_>>();
     if same_score.len() > 1 {
         let mut ids = HashSet::new();
@@ -951,20 +977,6 @@ fn find_session(
             }
         }
         if ids.len() == 1 {
-            let unique_homes = same_score
-                .iter()
-                .map(|(_, session)| index_home_path(&session.home))
-                .collect::<HashSet<_>>();
-            if unique_homes.len() != same_score.len() {
-                let options = same_score
-                    .iter()
-                    .map(|(_, session)| {
-                        format!("{}:{}", session.home.label, session_name(&session.path))
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                anyhow::bail!("session selector `{}` is ambiguous: {}", selector, options);
-            }
             let best = same_score
                 .into_iter()
                 .map(|(_, session)| session.clone())
@@ -975,6 +987,7 @@ fn find_session(
 
         let options = same_score
             .iter()
+            .take(6)
             .map(|(_, session)| format!("{}:{}", session.home.label, session_name(&session.path)))
             .collect::<Vec<_>>()
             .join(", ");
@@ -1377,6 +1390,10 @@ fn session_file_cwd(session: &SessionFile) -> Result<Option<PathBuf>> {
     session_cwd(&session.path)
 }
 
+fn session_file_model(session: &SessionFile) -> Result<Option<SessionModel>> {
+    session_model(&session.path)
+}
+
 fn session_id(path: &Path) -> Result<Option<String>> {
     Ok(session_meta(path)?
         .id
@@ -1385,6 +1402,37 @@ fn session_id(path: &Path) -> Result<Option<String>> {
 
 fn session_cwd(path: &Path) -> Result<Option<PathBuf>> {
     Ok(session_meta(path)?.cwd)
+}
+
+fn session_model(path: &Path) -> Result<Option<SessionModel>> {
+    let file = fs::File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut latest = None;
+
+    for line in reader.lines() {
+        let line = line?;
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if value.get("type").and_then(|kind| kind.as_str()) != Some("turn_context") {
+            continue;
+        }
+        let Some(payload) = value.get("payload") else {
+            continue;
+        };
+        let Some(model) = payload.get("model").and_then(|model| model.as_str()) else {
+            continue;
+        };
+        latest = Some(SessionModel {
+            model: model.to_string(),
+            effort: payload
+                .get("effort")
+                .and_then(|effort| effort.as_str())
+                .map(ToOwned::to_owned),
+        });
+    }
+
+    Ok(latest)
 }
 
 fn session_meta(path: &Path) -> Result<SessionMeta> {
@@ -1491,6 +1539,15 @@ mod tests {
             .unwrap();
     }
 
+    fn append_turn_context(path: &Path, model: &str, effort: &str) {
+        append_session_line(
+            path,
+            &format!(
+                "\n{{\"type\":\"turn_context\",\"payload\":{{\"model\":\"{model}\",\"effort\":\"{effort}\"}}}}\n"
+            ),
+        );
+    }
+
     fn test_conn(source_home: &Path, target_home: &Path) -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         db::init(&conn).unwrap();
@@ -1585,6 +1642,36 @@ mod tests {
     }
 
     #[test]
+    fn account_resume_preserves_session_model_and_effort() {
+        let root = temp_root("preserve-model");
+        let source_home = root.join("source");
+        let target_home = root.join("target");
+        let id = "11111111-2222-3333-4444-aaaaaaaaaaaa";
+        let source_file = write_session(&source_home, id, Path::new("/tmp/project"), "source");
+        append_turn_context(&source_file, "gpt-5.4", "high");
+        let conn = test_conn(&source_home, &target_home);
+
+        let args = vec!["resume".to_string(), id.to_string()];
+        let resolved = resolve_account_invocation(&conn, "target", &target_home, &args)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            resolved.args,
+            vec![
+                "--model",
+                "gpt-5.4",
+                "-c",
+                "model_reasoning_effort=\"high\"",
+                "resume",
+                id
+            ]
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn adopt_session_copies_once_then_reports_already_adopted() {
         let root = temp_root("adopt-once");
         let source_home = root.join("source");
@@ -1654,6 +1741,29 @@ mod tests {
         assert!(attached.exists());
         assert!(files_equal(&newer_file, &attached).unwrap());
         assert!(!files_equal(&older_file, &attached).unwrap());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn find_session_uses_newest_duplicate_with_same_id() {
+        let root = temp_root("newest-same-home-duplicate");
+        let home_path = root.join("home");
+        let id = "11111111-2222-3333-4444-bbbbbbbbbbbb";
+        let older_file = write_session(&home_path, id, Path::new("/tmp/project"), "older");
+        let newer_file = write_session(&home_path, id, Path::new("/tmp/project"), "newer");
+        append_session_line(&newer_file, "\n{\"type\":\"event_msg\"}\n");
+        let conn = Connection::open_in_memory().unwrap();
+        db::init(&conn).unwrap();
+        let home = SessionHome {
+            label: "home".to_string(),
+            path: home_path,
+        };
+
+        let found = find_session(&conn, &[home], id).unwrap().unwrap();
+
+        assert_eq!(found.path, newer_file);
+        assert_ne!(found.path, older_file);
 
         let _ = fs::remove_dir_all(root);
     }
