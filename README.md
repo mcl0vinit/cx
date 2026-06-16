@@ -253,13 +253,26 @@ cx index --sessions --rebuild
 cx index --limits
 ```
 
-Account-scoped resume copies the session into that account home first when needed:
+Account-scoped resume attaches the session to that account home first when needed:
 
 ```bash
 cx personal resume <session-id>
 ```
 
-The copy is conservative. `cx` refuses ambiguous selectors, duplicate target copies, and path overwrites.
+`cx` keeps canonical Codex session files under `~/.cx/session-store/sessions` and hardlinks them into account homes. Each account still has its own `CODEX_HOME` for auth and config, but attached sessions share one backing file so future resumes do not fork history. Hardlinks require the session store and account homes to live on the same filesystem.
+
+The attachment is conservative. `cx` refuses ambiguous selectors for different session ids, duplicate target copies, divergent target content, and path overwrites. If the same session id already exists in multiple homes, `cx` chooses the newest copy and imports it as canonical.
+
+Existing installs migrate during normal session indexing:
+
+```bash
+cx index --sessions
+cx index --sessions --dry-run
+```
+
+The migration imports discovered sessions into the central store and hardlinks identical account copies. Older divergent copies are left untouched instead of being overwritten silently.
+
+`cx` also takes a per-session lock while running `codex resume` so two accounts do not append to the same JSONL transcript at the same time.
 
 Repo-aware resume finds the latest known session whose recorded cwd is inside the current git repo:
 
@@ -270,13 +283,13 @@ cx resume-here --pool coding
 cx personal resume-here
 ```
 
-Explicit pre-copy is also available:
+Explicit pre-attachment is also available:
 
 ```bash
 cx personal adopt <session-id>
 ```
 
-Cross-account tmux migration also tries native history first. If `cx` can find a matching repo session, it copies that session into the target account home and respawns with native `codex resume`. If not, it falls back to the semantic resume prompt.
+Cross-account tmux migration also tries native history first. If `cx` can find a matching repo session, it attaches that session to the target account home and respawns with native `codex resume`. If not, it falls back to the semantic resume prompt.
 
 ### Config
 

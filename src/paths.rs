@@ -14,6 +14,18 @@ pub fn accounts_dir() -> Result<PathBuf> {
     Ok(cx_root()?.join("accounts"))
 }
 
+pub fn session_store_dir() -> Result<PathBuf> {
+    Ok(cx_root()?.join("session-store"))
+}
+
+pub fn canonical_sessions_dir() -> Result<PathBuf> {
+    Ok(session_store_dir()?.join("sessions"))
+}
+
+pub fn session_locks_dir() -> Result<PathBuf> {
+    Ok(session_store_dir()?.join("locks"))
+}
+
 pub fn account_home(name: &str) -> Result<PathBuf> {
     Ok(accounts_dir()?.join(name))
 }
@@ -37,12 +49,22 @@ pub fn config_path() -> Result<PathBuf> {
 pub fn ensure_root_dirs() -> Result<()> {
     std::fs::create_dir_all(cx_root()?)?;
     std::fs::create_dir_all(accounts_dir()?)?;
+    std::fs::create_dir_all(canonical_sessions_dir()?)?;
+    std::fs::create_dir_all(session_locks_dir()?)?;
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(cx_root()?, std::fs::Permissions::from_mode(0o700));
         let _ = std::fs::set_permissions(accounts_dir()?, std::fs::Permissions::from_mode(0o700));
+        let _ =
+            std::fs::set_permissions(session_store_dir()?, std::fs::Permissions::from_mode(0o700));
+        let _ = std::fs::set_permissions(
+            canonical_sessions_dir()?,
+            std::fs::Permissions::from_mode(0o700),
+        );
+        let _ =
+            std::fs::set_permissions(session_locks_dir()?, std::fs::Permissions::from_mode(0o700));
     }
 
     Ok(())
