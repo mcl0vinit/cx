@@ -2,6 +2,7 @@ use crate::{codex, config, daemon, db, limits, maintenance, paths, ui, util};
 use anyhow::Result;
 use rusqlite::Connection;
 use std::{
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
     process::Command,
@@ -30,6 +31,7 @@ pub fn run(conn: &Connection, fix: bool) -> Result<()> {
     check_codex(&mut report);
     check_default_pool(conn, &cfg, &mut report)?;
     check_accounts(conn, &cfg, &mut report)?;
+    check_session_store(conn, &mut report)?;
     check_tmux(&mut report);
     check_daemon(&mut report);
     check_git_hygiene(&mut report);
@@ -109,6 +111,7 @@ fn sync_indexes(conn: &Connection) -> Result<FixEntry> {
             sessions: true,
             limits: true,
             rebuild: false,
+            dry_run: false,
         },
     )?;
     let detail = results
@@ -235,6 +238,148 @@ fn check_accounts(conn: &Connection, cfg: &config::Config, report: &mut Report) 
         }
     }
     Ok(())
+}
+
+fn check_session_store(conn: &Connection, report: &mut Report) -> Result<()> {
+    let canonical = db::list_canonical_codex_sessions(conn)?;
+    let attachments = db::list_codex_session_attachments(conn)?;
+
+    if paths::session_store_dir()?.exists() {
+        report.ok(
+            "session store",
+            &util::display_path(&paths::session_store_dir()?),
+        );
+    } else {
+        report.warn_with_hint("session store", "missing", "cx index --sessions");
+    }
+
+    for session in &canonical {
+        if session.canonical_path.exists() {
+            report.ok(
+                "canonical session",
+                &format!(
+                    "{} {}",
+                    session.session_id,
+                    util::display_path(&session.canonical_path)
+                ),
+            );
+        } else {
+            report.fail_with_hint(
+                "canonical session",
+                &format!("{} missing", session.session_id),
+                "cx index --sessions --rebuild",
+            );
+        }
+    }
+
+    let canonical_by_id = canonical
+        .iter()
+        .map(|session| (session.session_id.as_str(), session))
+        .collect::<HashMap<_, _>>();
+    for attachment in &attachments {
+        let label = format!("attachment {}", attachment.home_label);
+        let Some(canonical) = canonical_by_id.get(attachment.session_id.as_str()) else {
+            report.fail_with_hint(
+                &label,
+                &format!("{} has no canonical record", attachment.session_id),
+                "cx index --sessions --rebuild",
+            );
+            continue;
+        };
+        if !attachment.path.exists() {
+            report.fail_with_hint(
+                &label,
+                &format!("{} missing", util::display_path(&attachment.path)),
+                "cx index --sessions",
+            );
+            continue;
+        }
+        if !same_file(&canonical.canonical_path, &attachment.path)? {
+            report.fail_with_hint(
+                &label,
+                &format!(
+                    "{} is not hardlinked to canonical {}",
+                    util::display_path(&attachment.path),
+                    util::display_path(&canonical.canonical_path)
+                ),
+                "cx index --sessions",
+            );
+        } else {
+            report.ok(
+                &label,
+                &format!(
+                    "{} -> {}",
+                    attachment.session_id,
+                    util::display_path(&attachment.path)
+                ),
+            );
+        }
+    }
+
+    for account in db::list_accounts(conn)? {
+        let sessions = db::list_indexed_codex_sessions_for_home(conn, &account.codex_home)?;
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for session in sessions {
+            if let Some(id) = session.session_id {
+                *counts.entry(id).or_default() += 1;
+            }
+        }
+        for (id, count) in counts {
+            if count > 1 {
+                report.fail_with_hint(
+                    &format!("account {}", account.name),
+                    &format!("{} copies of session {}", count, id),
+                    "remove duplicate session files or archive the older copy",
+                );
+            }
+        }
+
+        if account.codex_home.exists()
+            && !same_filesystem(&paths::canonical_sessions_dir()?, &account.codex_home)?
+        {
+            report.fail_with_hint(
+                &format!("account {}", account.name),
+                "CODEX_HOME is on a different filesystem than session store",
+                "move the account home under ~/.cx/accounts or set CX_HOME on the same volume",
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn same_file(left: &Path, right: &Path) -> Result<bool> {
+    let left_metadata = fs::metadata(left)?;
+    let right_metadata = fs::metadata(right)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(left_metadata.dev() == right_metadata.dev()
+            && left_metadata.ino() == right_metadata.ino())
+    }
+
+    #[cfg(not(unix))]
+    {
+        Ok(left_metadata.len() == right_metadata.len())
+    }
+}
+
+fn same_filesystem(left: &Path, right: &Path) -> Result<bool> {
+    let left_metadata = fs::metadata(left)?;
+    let right_metadata = fs::metadata(right)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(left_metadata.dev() == right_metadata.dev())
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = (left_metadata, right_metadata);
+        Ok(true)
+    }
 }
 
 fn check_tmux(report: &mut Report) {

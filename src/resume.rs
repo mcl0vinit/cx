@@ -6,7 +6,7 @@ use std::{
     cmp::Reverse,
     collections::{HashMap, HashSet},
     fs,
-    io::{self, BufRead, BufReader, Read},
+    io::{BufRead, BufReader, Read},
     path::{Path, PathBuf},
     process::Command,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -19,6 +19,7 @@ pub struct ResolvedInvocation {
     pub args: Vec<String>,
     pub cwd: Option<PathBuf>,
     pub summary: Option<ResumeSummary>,
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -42,6 +43,15 @@ struct ResumeSummaryDraft {
 pub struct SessionIndexReport {
     pub homes: usize,
     pub sessions: usize,
+    pub migration: SessionMigrationReport,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SessionMigrationReport {
+    pub imported: usize,
+    pub attached: usize,
+    pub skipped_divergent: usize,
+    pub failed: usize,
 }
 
 #[derive(Debug)]
@@ -152,6 +162,39 @@ pub fn resolve_account_invocation(
     };
 
     if let Some(session) = selected_session {
+        if let ResumeRequest::Selector(_) = &request {
+            let id = session_file_id(&session)?.ok_or_else(|| {
+                anyhow!("could not read session id from {}", session.path.display())
+            })?;
+            let homes = session_homes(conn, Some(account_home))?;
+            if let Some(newest) = latest_session_with_id(conn, &homes, &id)? {
+                if newest.modified > session.modified && !same_path(&newest.path, &session.path) {
+                    let source_label = newest.home.label.clone();
+                    let source_cwd = session_file_cwd(&newest)?;
+                    let adopted = adopt_session_file(conn, account_name, &selected_home, newest)?;
+                    let action = if adopted.already_adopted {
+                        "already adopted"
+                    } else {
+                        "adopted"
+                    }
+                    .to_string();
+                    let target_session =
+                        SessionFile::from_adopted_target(selected_home.clone(), adopted.target);
+                    return Ok(Some(resolved_invocation(
+                        selected_home.path.clone(),
+                        args,
+                        &request,
+                        &target_session,
+                        Some(ResumeSummaryDraft {
+                            repo: source_cwd,
+                            source: source_label,
+                            target: selected_home.label,
+                            action,
+                        }),
+                    )?));
+                }
+            }
+        }
         return Ok(Some(resolved_invocation(
             selected_home.path,
             args,
@@ -321,17 +364,39 @@ fn adopt_session_file(
 ) -> Result<AdoptionResult> {
     let id = session_file_id(&source)?
         .ok_or_else(|| anyhow!("could not read session id from {}", source.path.display()))?;
+    let canonical = ensure_canonical_session(conn, &id, &source)?;
 
     let target_matches = sessions_with_id(conn, target_home, &id)?;
     match target_matches.as_slice() {
         [] => {}
         [existing] => {
-            if files_equal(&source.path, &existing.path)? {
+            if same_file(&canonical.path, &existing.path)? {
+                record_attachment(conn, &id, target_home, &existing.path)?;
                 return Ok(AdoptionResult {
                     session_id: id,
-                    source: source.path,
+                    source: canonical.path,
                     target: existing.path.clone(),
                     already_adopted: true,
+                });
+            }
+            if files_equal(&canonical.path, &existing.path)? {
+                replace_with_hardlink(&canonical.path, &existing.path)?;
+                record_attachment(conn, &id, target_home, &existing.path)?;
+                return Ok(AdoptionResult {
+                    session_id: id,
+                    source: canonical.path,
+                    target: existing.path.clone(),
+                    already_adopted: true,
+                });
+            }
+            if file_is_prefix(&existing.path, &canonical.path)? {
+                replace_with_hardlink_allowing_prefix(&canonical.path, &existing.path)?;
+                record_attachment(conn, &id, target_home, &existing.path)?;
+                return Ok(AdoptionResult {
+                    session_id: id,
+                    source: canonical.path,
+                    target: existing.path.clone(),
+                    already_adopted: false,
                 });
             }
             anyhow::bail!(
@@ -367,14 +432,140 @@ fn adopt_session_file(
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent)?;
     }
-    copy_session_file(&source.path, &target)?;
+    attach_session_file(&canonical.path, &target)?;
+    record_attachment(conn, &id, target_home, &target)?;
 
     Ok(AdoptionResult {
         session_id: id,
-        source: source.path,
+        source: canonical.path,
         target,
         already_adopted: false,
     })
+}
+
+struct CanonicalSessionFile {
+    path: PathBuf,
+}
+
+fn ensure_canonical_session(
+    conn: &Connection,
+    session_id: &str,
+    source: &SessionFile,
+) -> Result<CanonicalSessionFile> {
+    let source_modified = system_time_nanos(source.modified);
+    let source_size = fs::metadata(&source.path)?.len() as i64;
+
+    if let Some(existing) = db::get_canonical_codex_session(conn, session_id)? {
+        if existing.canonical_path.exists() {
+            let existing_modified = fs::metadata(&existing.canonical_path)
+                .and_then(|metadata| metadata.modified())
+                .map(system_time_nanos)
+                .unwrap_or(existing.modified_nanos);
+            if existing_modified >= source_modified
+                || files_equal(&existing.canonical_path, &source.path)?
+            {
+                return Ok(CanonicalSessionFile {
+                    path: existing.canonical_path,
+                });
+            }
+        }
+    }
+
+    let canonical_path = canonical_session_path(source)?;
+    if canonical_path.exists() && !files_equal(&canonical_path, &source.path)? {
+        let canonical_modified = fs::metadata(&canonical_path)
+            .and_then(|metadata| metadata.modified())
+            .map(system_time_nanos)
+            .unwrap_or(0);
+        if canonical_modified > source_modified {
+            db::upsert_canonical_codex_session(
+                conn,
+                db::CanonicalCodexSessionUpsert {
+                    session_id: session_id.to_string(),
+                    canonical_path: canonical_path.clone(),
+                    source_path: canonical_path.clone(),
+                    source_home_label: "canonical".to_string(),
+                    cwd: session_file_cwd(source)?,
+                    modified_nanos: canonical_modified,
+                    size_bytes: fs::metadata(&canonical_path)?.len() as i64,
+                },
+            )?;
+            return Ok(CanonicalSessionFile {
+                path: canonical_path,
+            });
+        }
+        fs::remove_file(&canonical_path)?;
+    }
+
+    if let Some(parent) = canonical_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    attach_session_file(&source.path, &canonical_path)?;
+    db::upsert_canonical_codex_session(
+        conn,
+        db::CanonicalCodexSessionUpsert {
+            session_id: session_id.to_string(),
+            canonical_path: canonical_path.clone(),
+            source_path: source.path.clone(),
+            source_home_label: source.home.label.clone(),
+            cwd: session_file_cwd(source)?,
+            modified_nanos: source_modified,
+            size_bytes: source_size,
+        },
+    )?;
+    Ok(CanonicalSessionFile {
+        path: canonical_path,
+    })
+}
+
+fn canonical_session_path(source: &SessionFile) -> Result<PathBuf> {
+    let sessions_root = source.home.path.join("sessions");
+    let relative = source.path.strip_prefix(&sessions_root).with_context(|| {
+        format!(
+            "source session {} is not under {}",
+            source.path.display(),
+            sessions_root.display()
+        )
+    })?;
+    if relative
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        anyhow::bail!("source session path contains parent directory components");
+    }
+    Ok(canonical_sessions_root(source)?.join(relative))
+}
+
+#[cfg(test)]
+fn canonical_sessions_root(source: &SessionFile) -> Result<PathBuf> {
+    let root = source
+        .home
+        .path
+        .parent()
+        .ok_or_else(|| anyhow!("test session home has no parent"))?;
+    Ok(root.join("cx-home").join("session-store").join("sessions"))
+}
+
+#[cfg(not(test))]
+fn canonical_sessions_root(_source: &SessionFile) -> Result<PathBuf> {
+    paths::canonical_sessions_dir()
+}
+
+fn record_attachment(
+    conn: &Connection,
+    session_id: &str,
+    target_home: &SessionHome,
+    target: &Path,
+) -> Result<()> {
+    db::upsert_codex_session_attachment(
+        conn,
+        db::CodexSessionAttachmentUpsert {
+            session_id: session_id.to_string(),
+            home_path: index_home_path(target_home),
+            home_label: target_home.label.clone(),
+            path: target.to_path_buf(),
+        },
+    )
 }
 
 pub fn default_resume_home(conn: &Connection, preferred_home: Option<&Path>) -> Result<PathBuf> {
@@ -433,12 +624,116 @@ pub fn sync_all_session_indexes(conn: &Connection, rebuild: bool) -> Result<Sess
         db::clear_indexed_codex_sessions(conn)?;
     }
     sync_session_index(conn, &homes)?;
+    let migration = migrate_indexed_sessions_to_canonical_store(conn, &homes)?;
     let home_paths = homes.iter().map(index_home_path).collect::<Vec<_>>();
     let sessions = db::list_indexed_codex_sessions_for_homes(conn, &home_paths)?.len();
     Ok(SessionIndexReport {
         homes: homes.len(),
         sessions,
+        migration,
     })
+}
+
+pub fn preview_session_migration(conn: &Connection) -> Result<SessionIndexReport> {
+    let homes = session_homes(conn, None)?;
+    sync_session_index(conn, &homes)?;
+    let migration = migration_report(conn, &homes)?;
+    let home_paths = homes.iter().map(index_home_path).collect::<Vec<_>>();
+    let sessions = db::list_indexed_codex_sessions_for_homes(conn, &home_paths)?.len();
+    Ok(SessionIndexReport {
+        homes: homes.len(),
+        sessions,
+        migration,
+    })
+}
+
+fn migrate_indexed_sessions_to_canonical_store(
+    conn: &Connection,
+    homes: &[SessionHome],
+) -> Result<SessionMigrationReport> {
+    let mut by_id: HashMap<String, Vec<SessionFile>> = HashMap::new();
+    for session in all_sessions(conn, homes)? {
+        if let Some(id) = session_file_id(&session)? {
+            by_id.entry(id).or_default().push(session);
+        }
+    }
+
+    let mut report = SessionMigrationReport::default();
+    for (id, mut sessions) in by_id {
+        sessions.sort_by_key(|session| session.modified);
+        let Some(source) = sessions.last().cloned() else {
+            continue;
+        };
+        let existed = db::get_canonical_codex_session(conn, &id)?
+            .is_some_and(|session| session.canonical_path.exists());
+        let canonical = ensure_canonical_session(conn, &id, &source)?;
+        if !existed {
+            report.imported += 1;
+        }
+        for session in sessions {
+            if same_file(&canonical.path, &session.path)? {
+                record_attachment(conn, &id, &session.home, &session.path)?;
+                report.attached += 1;
+                continue;
+            }
+            if files_equal(&canonical.path, &session.path)? {
+                match replace_with_hardlink(&canonical.path, &session.path)
+                    .and_then(|()| record_attachment(conn, &id, &session.home, &session.path))
+                {
+                    Ok(()) => report.attached += 1,
+                    Err(_) => report.failed += 1,
+                }
+            } else {
+                report.skipped_divergent += 1;
+            }
+        }
+    }
+    Ok(report)
+}
+
+fn migration_report(conn: &Connection, homes: &[SessionHome]) -> Result<SessionMigrationReport> {
+    let mut by_id: HashMap<String, Vec<SessionFile>> = HashMap::new();
+    for session in all_sessions(conn, homes)? {
+        if let Some(id) = session_file_id(&session)? {
+            by_id.entry(id).or_default().push(session);
+        }
+    }
+
+    let mut report = SessionMigrationReport::default();
+    for (id, mut sessions) in by_id {
+        sessions.sort_by_key(|session| session.modified);
+        let Some(source) = sessions.last().cloned() else {
+            continue;
+        };
+        let canonical = db::get_canonical_codex_session(conn, &id)?;
+        if canonical
+            .as_ref()
+            .is_none_or(|session| !session.canonical_path.exists())
+        {
+            report.imported += 1;
+        }
+        for session in sessions {
+            match canonical.as_ref() {
+                Some(canonical) if canonical.canonical_path.exists() => {
+                    if same_file(&canonical.canonical_path, &session.path)?
+                        || files_equal(&canonical.canonical_path, &session.path)?
+                    {
+                        report.attached += 1;
+                    } else {
+                        report.skipped_divergent += 1;
+                    }
+                }
+                _ => {
+                    if files_equal(&source.path, &session.path)? {
+                        report.attached += 1;
+                    } else {
+                        report.skipped_divergent += 1;
+                    }
+                }
+            }
+        }
+    }
+    Ok(report)
 }
 
 fn parse_resume_request(args: &[String]) -> Option<ResumeRequest> {
@@ -478,6 +773,7 @@ fn resolved_invocation(
         home,
         args: rewrite_resume_args(args, request, &id),
         cwd: session_file_cwd(session)?,
+        session_id: Some(id.clone()),
         summary: summary.map(|summary| ResumeSummary {
             repo: summary.repo,
             session_id: id,
@@ -648,6 +944,35 @@ fn find_session(
         .take(6)
         .collect::<Vec<_>>();
     if same_score.len() > 1 {
+        let mut ids = HashSet::new();
+        for (_, session) in &same_score {
+            if let Some(id) = session_file_id(session)? {
+                ids.insert(id);
+            }
+        }
+        if ids.len() == 1 {
+            let unique_homes = same_score
+                .iter()
+                .map(|(_, session)| index_home_path(&session.home))
+                .collect::<HashSet<_>>();
+            if unique_homes.len() != same_score.len() {
+                let options = same_score
+                    .iter()
+                    .map(|(_, session)| {
+                        format!("{}:{}", session.home.label, session_name(&session.path))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                anyhow::bail!("session selector `{}` is ambiguous: {}", selector, options);
+            }
+            let best = same_score
+                .into_iter()
+                .map(|(_, session)| session.clone())
+                .max_by_key(|session| session.modified)
+                .expect("same_score is not empty");
+            return Ok(Some(best));
+        }
+
         let options = same_score
             .iter()
             .map(|(_, session)| format!("{}:{}", session.home.label, session_name(&session.path)))
@@ -667,6 +992,24 @@ fn sessions_with_id(conn: &Connection, home: &SessionHome, id: &str) -> Result<V
         }
     }
     Ok(matches)
+}
+
+fn latest_session_with_id(
+    conn: &Connection,
+    homes: &[SessionHome],
+    id: &str,
+) -> Result<Option<SessionFile>> {
+    let mut latest = None;
+    for session in all_sessions(conn, homes)? {
+        if session_file_id(&session)?.as_deref() == Some(id)
+            && latest
+                .as_ref()
+                .is_none_or(|current: &SessionFile| session.modified > current.modified)
+        {
+            latest = Some(session);
+        }
+    }
+    Ok(latest)
 }
 
 fn all_sessions(conn: &Connection, homes: &[SessionHome]) -> Result<Vec<SessionFile>> {
@@ -911,46 +1254,88 @@ fn files_equal(left: &Path, right: &Path) -> Result<bool> {
     }
 }
 
-fn copy_session_file(source: &Path, target: &Path) -> Result<()> {
-    if let Err(error) = clone_session_file(source, target) {
-        tracing::debug!(
-            source = %source.display(),
-            target = %target.display(),
-            error = %error,
-            "session clone unavailable; falling back to byte copy"
+fn same_file(left: &Path, right: &Path) -> Result<bool> {
+    let left_metadata = fs::metadata(left)?;
+    let right_metadata = fs::metadata(right)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(left_metadata.dev() == right_metadata.dev()
+            && left_metadata.ino() == right_metadata.ino())
+    }
+
+    #[cfg(not(unix))]
+    {
+        Ok(left_metadata.len() == right_metadata.len() && files_equal(left, right)?)
+    }
+}
+
+fn attach_session_file(source: &Path, target: &Path) -> Result<()> {
+    fs::hard_link(source, target).with_context(|| {
+        format!(
+            "failed to hardlink session {} to {}; keep cx account homes and session store on the same filesystem",
+            source.display(),
+            target.display()
+        )
+    })
+}
+
+fn replace_with_hardlink(source: &Path, target: &Path) -> Result<()> {
+    if same_file(source, target)? {
+        return Ok(());
+    }
+    if !files_equal(source, target)? {
+        anyhow::bail!(
+            "cannot replace {} with a hardlink to {}; contents differ",
+            target.display(),
+            source.display()
         );
-        fs::copy(source, target)?;
     }
-    Ok(())
+    fs::remove_file(target)?;
+    attach_session_file(source, target)
 }
 
-#[cfg(target_os = "macos")]
-fn clone_session_file(source: &Path, target: &Path) -> io::Result<()> {
-    use std::{ffi::CString, os::unix::ffi::OsStrExt};
-
-    extern "C" {
-        fn clonefile(src: *const i8, dst: *const i8, flags: u32) -> i32;
+fn replace_with_hardlink_allowing_prefix(source: &Path, target: &Path) -> Result<()> {
+    if same_file(source, target)? {
+        return Ok(());
     }
-
-    let source = CString::new(source.as_os_str().as_bytes())
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-    let target = CString::new(target.as_os_str().as_bytes())
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-
-    let result = unsafe { clonefile(source.as_ptr(), target.as_ptr(), 0) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
+    if !files_equal(source, target)? && !file_is_prefix(target, source)? {
+        anyhow::bail!(
+            "cannot replace {} with a hardlink to {}; contents differ",
+            target.display(),
+            source.display()
+        );
     }
+    fs::remove_file(target)?;
+    attach_session_file(source, target)
 }
 
-#[cfg(not(target_os = "macos"))]
-fn clone_session_file(_source: &Path, _target: &Path) -> io::Result<()> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "copy-on-write clone is not implemented on this platform",
-    ))
+fn file_is_prefix(prefix: &Path, full: &Path) -> Result<bool> {
+    let prefix_metadata = fs::metadata(prefix)?;
+    let full_metadata = fs::metadata(full)?;
+    if prefix_metadata.len() > full_metadata.len() {
+        return Ok(false);
+    }
+
+    let mut prefix_file = fs::File::open(prefix)?;
+    let mut full_file = fs::File::open(full)?;
+    let mut prefix_buffer = vec![0; FILE_COMPARE_BUFFER_SIZE];
+    let mut full_buffer = vec![0; FILE_COMPARE_BUFFER_SIZE];
+
+    loop {
+        let prefix_read = prefix_file.read(&mut prefix_buffer)?;
+        if prefix_read == 0 {
+            return Ok(true);
+        }
+        let full_read = full_file.read(&mut full_buffer[..prefix_read])?;
+        if full_read != prefix_read {
+            return Ok(false);
+        }
+        if prefix_buffer[..prefix_read] != full_buffer[..prefix_read] {
+            return Ok(false);
+        }
+    }
 }
 
 fn match_score(path: &Path, selector: &str) -> Option<u8> {
@@ -1097,6 +1482,15 @@ mod tests {
         path
     }
 
+    fn append_session_line(path: &Path, text: &str) {
+        fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .unwrap()
+            .write_all(text.as_bytes())
+            .unwrap();
+    }
+
     fn test_conn(source_home: &Path, target_home: &Path) -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         db::init(&conn).unwrap();
@@ -1202,8 +1596,9 @@ mod tests {
 
         let adopted = adopt_session(&conn, &target, id).unwrap();
         assert!(!adopted.already_adopted);
-        assert_eq!(adopted.source, source_file);
+        assert!(adopted.source.starts_with(root.join("cx-home")));
         assert!(adopted.target.exists());
+        assert!(files_equal(&source_file, &adopted.target).unwrap());
 
         let second = adopt_session(&conn, &target, id).unwrap();
         assert!(second.already_adopted);
@@ -1231,13 +1626,69 @@ mod tests {
     }
 
     #[test]
-    fn session_file_copy_and_compare_are_independent() {
-        let root = temp_root("copy-compare");
+    fn account_resume_uses_newest_duplicate_from_other_home() {
+        let root = temp_root("newest-duplicate");
+        let older_home = root.join("older");
+        let newer_home = root.join("newer");
+        let target_home = root.join("target");
+        let id = "11111111-2222-3333-4444-888888888888";
+        let older_file = write_session(&older_home, id, Path::new("/tmp/project"), "older");
+        let newer_file = write_session(&newer_home, id, Path::new("/tmp/project"), "newer");
+        append_session_line(&newer_file, "\n{\"type\":\"event_msg\"}\n");
+        let conn = Connection::open_in_memory().unwrap();
+        db::init(&conn).unwrap();
+        db::upsert_account(&conn, "older", older_home.clone()).unwrap();
+        db::upsert_account(&conn, "newer", newer_home.clone()).unwrap();
+        db::upsert_account(&conn, "target", target_home.clone()).unwrap();
+
+        let args = vec!["resume".to_string(), id.to_string()];
+        let resolved = resolve_account_invocation(&conn, "target", &target_home, &args)
+            .unwrap()
+            .unwrap();
+
+        let attached = resolved.home.join("sessions").join(
+            newer_file
+                .strip_prefix(newer_home.join("sessions"))
+                .unwrap(),
+        );
+        assert!(attached.exists());
+        assert!(files_equal(&newer_file, &attached).unwrap());
+        assert!(!files_equal(&older_file, &attached).unwrap());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn account_resume_replaces_target_prefix_with_newest_canonical() {
+        let root = temp_root("prefix-replace");
+        let source_home = root.join("source");
+        let target_home = root.join("target");
+        let id = "11111111-2222-3333-4444-999999999999";
+        let target_file = write_session(&target_home, id, Path::new("/tmp/project"), "source");
+        let source_file = write_session(&source_home, id, Path::new("/tmp/project"), "source");
+        append_session_line(&source_file, "\n{\"type\":\"event_msg\"}\n");
+        let conn = test_conn(&source_home, &target_home);
+
+        let args = vec!["resume".to_string(), id.to_string()];
+        let resolved = resolve_account_invocation(&conn, "target", &target_home, &args)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(resolved.home, target_home);
+        assert!(same_file(&source_file, &target_file).unwrap());
+        assert!(files_equal(&source_file, &target_file).unwrap());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn session_file_attach_uses_shared_hardlink() {
+        let root = temp_root("attach-compare");
         fs::create_dir_all(&root).unwrap();
         let source = root.join("source.jsonl");
         let same = root.join("same.jsonl");
         let different = root.join("different.jsonl");
-        let copied = root.join("copied.jsonl");
+        let attached = root.join("attached.jsonl");
 
         fs::write(&source, b"one\ntwo\nthree\n").unwrap();
         fs::write(&same, b"one\ntwo\nthree\n").unwrap();
@@ -1246,18 +1697,19 @@ mod tests {
         assert!(files_equal(&source, &same).unwrap());
         assert!(!files_equal(&source, &different).unwrap());
 
-        copy_session_file(&source, &copied).unwrap();
-        assert!(files_equal(&source, &copied).unwrap());
+        attach_session_file(&source, &attached).unwrap();
+        assert!(same_file(&source, &attached).unwrap());
+        assert!(files_equal(&source, &attached).unwrap());
 
         fs::OpenOptions::new()
             .append(true)
-            .open(&copied)
+            .open(&attached)
             .unwrap()
             .write_all(b"four\n")
             .unwrap();
 
-        assert!(!files_equal(&source, &copied).unwrap());
-        assert_eq!(fs::read(&source).unwrap(), b"one\ntwo\nthree\n");
+        assert!(files_equal(&source, &attached).unwrap());
+        assert_eq!(fs::read(&source).unwrap(), b"one\ntwo\nthree\nfour\n");
 
         let _ = fs::remove_dir_all(root);
     }

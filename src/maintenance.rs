@@ -7,6 +7,7 @@ pub struct IndexOptions {
     pub sessions: bool,
     pub limits: bool,
     pub rebuild: bool,
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -23,16 +24,40 @@ pub fn sync_indexes(conn: &Connection, options: IndexOptions) -> Result<Vec<Inde
     let mut results = Vec::new();
 
     if sessions {
-        let report = resume::sync_all_session_indexes(conn, options.rebuild)?;
+        let report = if options.dry_run {
+            resume::preview_session_migration(conn)?
+        } else {
+            resume::sync_all_session_indexes(conn, options.rebuild)?
+        };
         results.push(IndexResult {
             component: "sessions".to_string(),
-            action: action(options.rebuild),
+            action: if options.dry_run {
+                "preview".to_string()
+            } else {
+                action(options.rebuild)
+            },
             count: report.sessions,
-            detail: format!("{} homes", report.homes),
+            detail: format!(
+                "{} homes, {} imported, {} attached, {} divergent, {} failed",
+                report.homes,
+                report.migration.imported,
+                report.migration.attached,
+                report.migration.skipped_divergent,
+                report.migration.failed
+            ),
         });
     }
 
     if limits {
+        if options.dry_run {
+            results.push(IndexResult {
+                component: "limits".to_string(),
+                action: "preview".to_string(),
+                count: 0,
+                detail: "dry-run only previews session migration".to_string(),
+            });
+            return Ok(results);
+        }
         let report = sync_limit_snapshots(conn, options.rebuild)?;
         results.push(IndexResult {
             component: "limits".to_string(),

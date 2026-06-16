@@ -78,6 +78,39 @@ pub struct IndexedCodexSessionUpsert {
 }
 
 #[derive(Debug, Clone)]
+pub struct CanonicalCodexSession {
+    pub session_id: String,
+    pub canonical_path: PathBuf,
+    pub modified_nanos: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct CodexSessionAttachment {
+    pub session_id: String,
+    pub home_label: String,
+    pub path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub struct CanonicalCodexSessionUpsert {
+    pub session_id: String,
+    pub canonical_path: PathBuf,
+    pub source_path: PathBuf,
+    pub source_home_label: String,
+    pub cwd: Option<PathBuf>,
+    pub modified_nanos: i64,
+    pub size_bytes: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct CodexSessionAttachmentUpsert {
+    pub session_id: String,
+    pub home_path: PathBuf,
+    pub home_label: String,
+    pub path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
 pub struct CachedLimitSnapshot {
     pub home_path: PathBuf,
     pub observed_at: String,
@@ -163,6 +196,33 @@ pub fn init(conn: &Connection) -> Result<()> {
 
         create index if not exists idx_codex_sessions_modified
           on codex_sessions(modified_nanos);
+
+        create table if not exists canonical_codex_sessions (
+          session_id text primary key,
+          canonical_path text not null,
+          source_path text not null,
+          source_home_label text not null,
+          cwd text,
+          modified_nanos integer not null,
+          size_bytes integer not null,
+          created_at text not null,
+          updated_at text not null
+        );
+
+        create index if not exists idx_canonical_codex_sessions_modified
+          on canonical_codex_sessions(modified_nanos);
+
+        create table if not exists codex_session_attachments (
+          session_id text not null,
+          home_path text not null,
+          home_label text not null,
+          path text not null,
+          attached_at text not null,
+          primary key (session_id, home_path)
+        );
+
+        create index if not exists idx_codex_session_attachments_path
+          on codex_session_attachments(path);
 
         create table if not exists limit_snapshots (
           home_path text primary key,
@@ -612,6 +672,116 @@ pub fn clear_indexed_codex_sessions(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+pub fn get_canonical_codex_session(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Option<CanonicalCodexSession>> {
+    conn.query_row(
+        r#"
+        select session_id, canonical_path, source_path, source_home_label,
+               cwd, modified_nanos, size_bytes
+        from canonical_codex_sessions
+        where session_id = ?1
+        "#,
+        params![session_id],
+        row_to_canonical_codex_session,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+pub fn list_canonical_codex_sessions(conn: &Connection) -> Result<Vec<CanonicalCodexSession>> {
+    let mut stmt = conn.prepare(
+        r#"
+        select session_id, canonical_path, source_path, source_home_label,
+               cwd, modified_nanos, size_bytes
+        from canonical_codex_sessions
+        order by modified_nanos desc
+        "#,
+    )?;
+    let rows = stmt.query_map([], row_to_canonical_codex_session)?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+pub fn upsert_canonical_codex_session(
+    conn: &Connection,
+    session: CanonicalCodexSessionUpsert,
+) -> Result<()> {
+    let now = util::now();
+    conn.execute(
+        r#"
+        insert into canonical_codex_sessions (
+          session_id, canonical_path, source_path, source_home_label,
+          cwd, modified_nanos, size_bytes, created_at, updated_at
+        ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)
+        on conflict(session_id) do update set
+          canonical_path = excluded.canonical_path,
+          source_path = excluded.source_path,
+          source_home_label = excluded.source_home_label,
+          cwd = excluded.cwd,
+          modified_nanos = excluded.modified_nanos,
+          size_bytes = excluded.size_bytes,
+          updated_at = excluded.updated_at
+        "#,
+        params![
+            session.session_id,
+            session.canonical_path.to_string_lossy().to_string(),
+            session.source_path.to_string_lossy().to_string(),
+            session.source_home_label,
+            session.cwd.map(|cwd| cwd.to_string_lossy().to_string()),
+            session.modified_nanos,
+            session.size_bytes,
+            now,
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn upsert_codex_session_attachment(
+    conn: &Connection,
+    attachment: CodexSessionAttachmentUpsert,
+) -> Result<()> {
+    conn.execute(
+        r#"
+        insert into codex_session_attachments (
+          session_id, home_path, home_label, path, attached_at
+        ) values (?1, ?2, ?3, ?4, ?5)
+        on conflict(session_id, home_path) do update set
+          home_label = excluded.home_label,
+          path = excluded.path,
+          attached_at = excluded.attached_at
+        "#,
+        params![
+            attachment.session_id,
+            attachment.home_path.to_string_lossy().to_string(),
+            attachment.home_label,
+            attachment.path.to_string_lossy().to_string(),
+            util::now(),
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn list_codex_session_attachments(conn: &Connection) -> Result<Vec<CodexSessionAttachment>> {
+    let mut stmt = conn.prepare(
+        r#"
+        select session_id, home_label, path
+        from codex_session_attachments
+        order by home_label, session_id
+        "#,
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(CodexSessionAttachment {
+            session_id: row.get(0)?,
+            home_label: row.get(1)?,
+            path: PathBuf::from(row.get::<_, String>(2)?),
+        })
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
 pub fn get_cached_limit_snapshot(
     conn: &Connection,
     home_path: &Path,
@@ -687,6 +857,16 @@ fn row_to_indexed_codex_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<Ind
         cwd: row.get::<_, Option<String>>(4)?.map(PathBuf::from),
         modified_nanos: row.get(5)?,
         size_bytes: row.get(6)?,
+    })
+}
+
+fn row_to_canonical_codex_session(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<CanonicalCodexSession> {
+    Ok(CanonicalCodexSession {
+        session_id: row.get(0)?,
+        canonical_path: PathBuf::from(row.get::<_, String>(1)?),
+        modified_nanos: row.get(5)?,
     })
 }
 

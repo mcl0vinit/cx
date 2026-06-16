@@ -19,7 +19,11 @@ use anyhow::{anyhow, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
 use rusqlite::Connection;
-use std::{fs, path::PathBuf, process::Stdio};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::Stdio,
+};
 
 #[derive(Parser, Debug)]
 #[command(name = "cx")]
@@ -179,6 +183,8 @@ enum Commands {
         limits: bool,
         #[arg(long, help = "Clear selected indexes before syncing")]
         rebuild: bool,
+        #[arg(long, help = "Preview session-store migration without attaching files")]
+        dry_run: bool,
     },
     #[command(about = "Run diagnostics for local cx setup")]
     Doctor {
@@ -408,7 +414,8 @@ fn main() -> Result<()> {
             sessions,
             limits,
             rebuild,
-        }) => handle_index(&conn, sessions, limits, rebuild),
+            dry_run,
+        }) => handle_index(&conn, sessions, limits, rebuild, dry_run),
         Some(Commands::Doctor { fix }) => doctor::run(&conn, fix),
         Some(Commands::Status) => handle_status(&conn),
         Some(Commands::Daemon { command }) => handle_daemon(command),
@@ -533,13 +540,20 @@ fn handle_refresh(
     refresh_targets(conn, name, all, pool_name, stale_only)
 }
 
-fn handle_index(conn: &Connection, sessions: bool, limits: bool, rebuild: bool) -> Result<()> {
+fn handle_index(
+    conn: &Connection,
+    sessions: bool,
+    limits: bool,
+    rebuild: bool,
+    dry_run: bool,
+) -> Result<()> {
     let results = maintenance::sync_indexes(
         conn,
         maintenance::IndexOptions {
             sessions,
             limits,
             rebuild,
+            dry_run,
         },
     )?;
     maintenance::print_index_results(&results);
@@ -833,11 +847,78 @@ fn run_resolved_codex(
     cwd_override: Option<PathBuf>,
 ) -> Result<()> {
     print_resume_summary(resolved.summary.as_ref());
+    let _lock = match resolved.session_id.as_deref() {
+        Some(session_id) => Some(SessionRunLock::acquire(session_id)?),
+        None => None,
+    };
     run_codex_direct(
         &resolved.home,
         cwd_override.or(resolved.cwd),
         &resolved.args,
     )
+}
+
+struct SessionRunLock {
+    path: PathBuf,
+}
+
+impl SessionRunLock {
+    fn acquire(session_id: &str) -> Result<Self> {
+        paths::ensure_root_dirs()?;
+        let path = paths::session_locks_dir()?.join(format!("{session_id}.lock"));
+        let payload = format!("pid={}\nstarted_at={}\n", std::process::id(), util::now());
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                use std::io::Write;
+                file.write_all(payload.as_bytes())?;
+                Ok(Self { path })
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if stale_lock(&path)? {
+                    let _ = fs::remove_file(&path);
+                    return Self::acquire(session_id);
+                }
+                let detail = fs::read_to_string(&path).unwrap_or_else(|_| "active".to_string());
+                anyhow::bail!(
+                    "session `{}` is already running ({})",
+                    session_id,
+                    detail.replace('\n', ", ").trim_end_matches(", ")
+                );
+            }
+            Err(error) => Err(error)
+                .with_context(|| format!("failed to create session lock {}", path.display())),
+        }
+    }
+}
+
+impl Drop for SessionRunLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn stale_lock(path: &Path) -> Result<bool> {
+    let contents = fs::read_to_string(path).unwrap_or_default();
+    let Some(pid) = contents
+        .lines()
+        .find_map(|line| line.strip_prefix("pid="))
+        .and_then(|value| value.parse::<u32>().ok())
+    else {
+        return Ok(false);
+    };
+
+    let status = std::process::Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .status();
+    match status {
+        Ok(status) => Ok(!status.success()),
+        Err(_) => Ok(false),
+    }
 }
 
 fn print_resume_summary(summary: Option<&resume::ResumeSummary>) {
