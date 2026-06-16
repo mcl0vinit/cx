@@ -1,9 +1,9 @@
 use crate::{db, util};
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Local, Utc};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::{
     cmp::Reverse,
     fs,
@@ -13,6 +13,9 @@ use std::{
 };
 
 const RECENT_LIMIT_SCAN_FILES: usize = 64;
+const DEFAULT_CHATGPT_BASE_URL: &str = "https://chatgpt.com/backend-api";
+const CHATGPT_TOKEN_REFRESH_URL: &str = "https://auth.openai.com/oauth/token";
+const CODEX_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LimitSnapshot {
@@ -95,6 +98,293 @@ pub fn refresh_snapshot_cache(
         write_snapshot_cache(conn, codex_home, snapshot)?;
     }
     Ok(snapshot)
+}
+
+pub fn refresh_snapshot_from_backend(
+    conn: &Connection,
+    codex_home: &Path,
+) -> Result<LimitSnapshot> {
+    let snapshot = backend_snapshot(codex_home)?;
+    write_snapshot_cache(conn, codex_home, &snapshot)?;
+    Ok(snapshot)
+}
+
+fn backend_snapshot(codex_home: &Path) -> Result<LimitSnapshot> {
+    let auth_path = codex_home.join("auth.json");
+    let usage_url = usage_url(codex_home);
+    let mut auth = read_auth_json(&auth_path)?;
+    let mut tokens = auth_tokens(&auth)?;
+
+    let payload = match fetch_backend_usage(
+        &usage_url,
+        &tokens.access_token,
+        tokens.account_id.as_deref(),
+    ) {
+        Ok(payload) => payload,
+        Err(error) if error.is_unauthorized() && tokens.refresh_token.is_some() => {
+            auth = refresh_auth_json(&auth_path, &auth, tokens.refresh_token.take().unwrap())?;
+            tokens = auth_tokens(&auth)?;
+            fetch_backend_usage(
+                &usage_url,
+                &tokens.access_token,
+                tokens.account_id.as_deref(),
+            )
+            .map_err(BackendFetchError::into_error)?
+        }
+        Err(error) => return Err(error.into_error()),
+    };
+
+    Ok(snapshot_from_backend_payload(
+        payload,
+        &auth_path,
+        Utc::now(),
+    ))
+}
+
+fn usage_url(codex_home: &Path) -> String {
+    let mut base_url = config_chatgpt_base_url(codex_home)
+        .unwrap_or_else(|| DEFAULT_CHATGPT_BASE_URL.to_string())
+        .trim_end_matches('/')
+        .to_string();
+    if (base_url.starts_with("https://chatgpt.com")
+        || base_url.starts_with("https://chat.openai.com"))
+        && !base_url.contains("/backend-api")
+    {
+        base_url = format!("{base_url}/backend-api");
+    }
+
+    if base_url.contains("/backend-api") {
+        format!("{base_url}/wham/usage")
+    } else {
+        format!("{base_url}/api/codex/usage")
+    }
+}
+
+fn config_chatgpt_base_url(codex_home: &Path) -> Option<String> {
+    let text = fs::read_to_string(codex_home.join("config.toml")).ok()?;
+    let value = text.parse::<toml::Value>().ok()?;
+    value
+        .get("chatgpt_base_url")
+        .and_then(toml::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+#[derive(Debug)]
+struct AuthTokens {
+    access_token: String,
+    refresh_token: Option<String>,
+    account_id: Option<String>,
+}
+
+fn read_auth_json(auth_path: &Path) -> Result<Value> {
+    let text = fs::read_to_string(auth_path)
+        .with_context(|| format!("failed to read {}", auth_path.display()))?;
+    serde_json::from_str(&text).with_context(|| format!("failed to parse {}", auth_path.display()))
+}
+
+fn auth_tokens(auth: &Value) -> Result<AuthTokens> {
+    let tokens = auth
+        .get("tokens")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow!("auth.json does not contain ChatGPT tokens"))?;
+    let access_token = tokens
+        .get("access_token")
+        .and_then(Value::as_str)
+        .filter(|token| !token.trim().is_empty())
+        .ok_or_else(|| anyhow!("auth.json does not contain a ChatGPT access token"))?
+        .to_string();
+    let refresh_token = tokens
+        .get("refresh_token")
+        .and_then(Value::as_str)
+        .filter(|token| !token.trim().is_empty())
+        .map(ToOwned::to_owned);
+    let account_id = tokens
+        .get("account_id")
+        .and_then(Value::as_str)
+        .filter(|account_id| !account_id.trim().is_empty())
+        .map(ToOwned::to_owned);
+
+    Ok(AuthTokens {
+        access_token,
+        refresh_token,
+        account_id,
+    })
+}
+
+#[derive(Debug)]
+enum BackendFetchError {
+    Status(u16, String),
+    Other(anyhow::Error),
+}
+
+impl BackendFetchError {
+    fn is_unauthorized(&self) -> bool {
+        matches!(self, Self::Status(401, _))
+    }
+
+    fn into_error(self) -> anyhow::Error {
+        match self {
+            Self::Status(status, body) => {
+                anyhow!(
+                    "Codex usage endpoint returned HTTP {status}: {}",
+                    first_line(&body)
+                )
+            }
+            Self::Other(error) => error,
+        }
+    }
+}
+
+fn fetch_backend_usage(
+    usage_url: &str,
+    access_token: &str,
+    account_id: Option<&str>,
+) -> std::result::Result<BackendUsagePayload, BackendFetchError> {
+    let mut request = ureq::get(usage_url)
+        .set("Authorization", &format!("Bearer {access_token}"))
+        .set("User-Agent", "codex-cli");
+    if let Some(account_id) = account_id {
+        request = request.set("ChatGPT-Account-ID", account_id);
+    }
+
+    let response = request.call().map_err(backend_fetch_error)?;
+    let body = response
+        .into_string()
+        .map_err(|error| BackendFetchError::Other(error.into()))?;
+    serde_json::from_str::<BackendUsagePayload>(&body)
+        .map_err(|error| BackendFetchError::Other(error.into()))
+}
+
+fn backend_fetch_error(error: ureq::Error) -> BackendFetchError {
+    match error {
+        ureq::Error::Status(status, response) => {
+            let body = response.into_string().unwrap_or_default();
+            BackendFetchError::Status(status, body)
+        }
+        ureq::Error::Transport(error) => BackendFetchError::Other(error.into()),
+    }
+}
+
+fn refresh_auth_json(auth_path: &Path, auth: &Value, refresh_token: String) -> Result<Value> {
+    let body = json!({
+        "client_id": CODEX_OAUTH_CLIENT_ID,
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+    });
+    let response = ureq::post(CHATGPT_TOKEN_REFRESH_URL)
+        .set("Content-Type", "application/json")
+        .set("User-Agent", "codex-cli")
+        .send_string(&serde_json::to_string(&body)?)
+        .map_err(backend_fetch_error)
+        .map_err(BackendFetchError::into_error)?;
+    let response_body = response
+        .into_string()
+        .context("failed to read refreshed Codex auth tokens")?;
+    let refresh = serde_json::from_str::<Value>(&response_body)
+        .context("failed to parse refreshed Codex auth tokens")?;
+
+    let mut updated = auth.clone();
+    let tokens = updated
+        .get_mut("tokens")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| anyhow!("auth.json does not contain ChatGPT tokens"))?;
+    for key in ["id_token", "access_token", "refresh_token"] {
+        if let Some(value) = refresh.get(key).and_then(Value::as_str) {
+            tokens.insert(key.to_string(), Value::String(value.to_string()));
+        }
+    }
+    updated["last_refresh"] = Value::String(Utc::now().to_rfc3339());
+    fs::write(auth_path, serde_json::to_string_pretty(&updated)?)
+        .with_context(|| format!("failed to update {}", auth_path.display()))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(auth_path, fs::Permissions::from_mode(0o600));
+    }
+
+    Ok(updated)
+}
+
+fn first_line(value: &str) -> String {
+    value
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("empty response")
+        .trim()
+        .to_string()
+}
+
+#[derive(Debug, Deserialize)]
+struct BackendUsagePayload {
+    plan_type: Option<String>,
+    rate_limit: Option<BackendRateLimit>,
+    credits: Option<BackendCredits>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BackendRateLimit {
+    primary_window: Option<BackendRateLimitWindow>,
+    secondary_window: Option<BackendRateLimitWindow>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BackendRateLimitWindow {
+    used_percent: f64,
+    reset_at: Option<i64>,
+    limit_window_seconds: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BackendCredits {
+    has_credits: Option<bool>,
+    unlimited: Option<bool>,
+    balance: Option<Value>,
+}
+
+fn snapshot_from_backend_payload(
+    payload: BackendUsagePayload,
+    source: &Path,
+    observed_at: DateTime<Utc>,
+) -> LimitSnapshot {
+    LimitSnapshot {
+        observed_at,
+        source: source.to_path_buf(),
+        limit_id: Some("codex".to_string()),
+        limit_name: None,
+        plan_type: payload.plan_type,
+        primary: payload
+            .rate_limit
+            .as_ref()
+            .and_then(|limits| limits.primary_window.as_ref())
+            .map(window_from_backend),
+        secondary: payload
+            .rate_limit
+            .as_ref()
+            .and_then(|limits| limits.secondary_window.as_ref())
+            .map(window_from_backend),
+        credits: payload.credits.as_ref().map(credits_from_backend),
+    }
+}
+
+fn window_from_backend(value: &BackendRateLimitWindow) -> LimitWindow {
+    LimitWindow {
+        used_percent: value.used_percent,
+        window_minutes: value.limit_window_seconds.map(|seconds| seconds / 60),
+        resets_at: value
+            .reset_at
+            .and_then(|seconds| DateTime::<Utc>::from_timestamp(seconds, 0)),
+    }
+}
+
+fn credits_from_backend(value: &BackendCredits) -> Credits {
+    Credits {
+        has_credits: value.has_credits,
+        unlimited: value.unlimited,
+        balance: value.balance.as_ref().and_then(value_to_string),
+    }
 }
 
 pub fn remaining_percent(window: &LimitWindow) -> f64 {
@@ -545,5 +835,85 @@ mod tests {
         assert_eq!(refreshed.primary.unwrap().used_percent, 80.0);
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn backend_usage_maps_primary_to_five_hour_and_secondary_to_weekly() {
+        let payload = serde_json::from_str::<BackendUsagePayload>(
+            r#"{
+                "plan_type": "pro",
+                "rate_limit": {
+                    "primary_window": {
+                        "used_percent": 100,
+                        "reset_at": 1781652339,
+                        "limit_window_seconds": 18000
+                    },
+                    "secondary_window": {
+                        "used_percent": 71,
+                        "reset_at": 1781745507,
+                        "limit_window_seconds": 604800
+                    }
+                },
+                "credits": {
+                    "has_credits": false,
+                    "unlimited": false,
+                    "balance": "0"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let snapshot = snapshot_from_backend_payload(
+            payload,
+            Path::new("/tmp/auth.json"),
+            DateTime::<Utc>::from_timestamp(1781640000, 0).unwrap(),
+        );
+
+        assert_eq!(snapshot.limit_id.as_deref(), Some("codex"));
+        assert_eq!(snapshot.plan_type.as_deref(), Some("pro"));
+        let primary = snapshot.primary.unwrap();
+        assert_eq!(primary.used_percent, 100.0);
+        assert_eq!(primary.window_minutes, Some(300));
+        let secondary = snapshot.secondary.unwrap();
+        assert_eq!(secondary.used_percent, 71.0);
+        assert_eq!(secondary.window_minutes, Some(10_080));
+        assert_eq!(snapshot.credits.unwrap().balance.as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn usage_url_matches_codex_backend_path_styles() {
+        let default_home = temp_root("usage-default");
+        assert_eq!(
+            usage_url(&default_home),
+            "https://chatgpt.com/backend-api/wham/usage"
+        );
+
+        let chatgpt_home = temp_root("usage-chatgpt");
+        fs::create_dir_all(&chatgpt_home).unwrap();
+        fs::write(
+            chatgpt_home.join("config.toml"),
+            r#"chatgpt_base_url = "https://chatgpt.com""#,
+        )
+        .unwrap();
+        assert_eq!(
+            usage_url(&chatgpt_home),
+            "https://chatgpt.com/backend-api/wham/usage"
+        );
+
+        let codex_home = temp_root("usage-codex-api");
+        fs::create_dir_all(&codex_home).unwrap();
+        fs::write(
+            codex_home.join("config.toml"),
+            r#"chatgpt_base_url = "https://example.test""#,
+        )
+        .unwrap();
+        assert_eq!(
+            usage_url(&codex_home),
+            "https://example.test/api/codex/usage"
+        );
+
+        let _ = fs::remove_dir_all(default_home);
+        let _ = fs::remove_dir_all(chatgpt_home);
+        let _ = fs::remove_dir_all(codex_home);
     }
 }

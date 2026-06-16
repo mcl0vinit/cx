@@ -110,7 +110,7 @@ limit_snapshot_max_age_minutes = 30
 
 [smart]
 # If true, `cx smart` refreshes accounts with stale/missing limit snapshots
-# before picking. This runs `codex exec` and may consume usage.
+# before picking. Refresh reads Codex account usage without starting a model turn.
 refresh_before_pick = false
 
 [daemon]

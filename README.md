@@ -173,7 +173,7 @@ Codex writes `rate_limits` snapshots into session JSONL files. `cx` reads the la
 - observed snapshot age
 - account health and active managed sessions
 
-`cx` caches the latest limit snapshot for each Codex home in `~/.cx/cx.sqlite`. On a cache miss it samples recent session files instead of parsing the full history tree. Online refreshes update the cache after Codex writes a new snapshot.
+`cx` caches the latest limit snapshot for each Codex home in `~/.cx/cx.sqlite`. On a cache miss it samples recent session files instead of parsing the full history tree. Explicit refreshes read Codex's account usage endpoint without starting a model turn.
 
 Local read:
 
@@ -185,7 +185,7 @@ cx watch --once
 
 In account status tables, `CODEX` is the number of discovered Codex history sessions in that account home. `MGD` is the number of active cx-managed tmux sessions.
 
-Refresh with a small Codex request:
+Run an active Codex health probe:
 
 ```bash
 cx account status personal --online
@@ -193,7 +193,7 @@ cx account status personal --online
 
 `--online` may consume usage because it runs `codex exec`.
 
-Refresh snapshots explicitly:
+Refresh snapshots without spending a model turn:
 
 ```bash
 cx refresh personal

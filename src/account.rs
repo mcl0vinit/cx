@@ -575,7 +575,10 @@ pub fn online_check(conn: &Connection, name: &str) -> Result<String> {
     };
 
     db::set_account_status(conn, name, status, error.as_deref())?;
-    if let Err(error) = limits::refresh_snapshot_cache(conn, &account.codex_home) {
+    if let Err(error) = limits::refresh_snapshot_from_backend(conn, &account.codex_home)
+        .map(|_| ())
+        .or_else(|_| limits::refresh_snapshot_cache(conn, &account.codex_home).map(|_| ()))
+    {
         tracing::debug!(
             account = name,
             error = %error,
@@ -608,6 +611,10 @@ pub fn refresh(conn: &Connection, names: &[String], stale_only: bool) -> Result<
 pub fn refresh_one(conn: &Connection, name: &str, stale_only: bool) -> Result<String> {
     let account =
         db::get_account(conn, name)?.ok_or_else(|| anyhow!("unknown account `{}`", name))?;
+    if account.disabled {
+        db::set_account_status(conn, name, "disabled", Some("account disabled"))?;
+        return Ok("disabled".to_string());
+    }
     if stale_only {
         let cfg = config::load()?;
         let snapshot = limits::latest_snapshot_cached(conn, &account.codex_home)?;
@@ -615,7 +622,49 @@ pub fn refresh_one(conn: &Connection, name: &str, stale_only: bool) -> Result<St
             return Ok("fresh".to_string());
         }
     }
-    online_check(conn, name)
+    match limits::refresh_snapshot_from_backend(conn, &account.codex_home) {
+        Ok(snapshot) => {
+            let status = if snapshot_is_limited(&snapshot) {
+                "limited"
+            } else {
+                "healthy"
+            };
+            db::set_account_status(conn, name, status, None)?;
+            Ok(status.to_string())
+        }
+        Err(error) => {
+            let message = error.to_string();
+            let status = passive_refresh_error_status(&message);
+            db::set_account_status(conn, name, status, Some(&message))?;
+            Ok(status.to_string())
+        }
+    }
+}
+
+fn snapshot_is_limited(snapshot: &limits::LimitSnapshot) -> bool {
+    snapshot
+        .primary
+        .as_ref()
+        .map(limits::is_exhausted)
+        .unwrap_or(false)
+        || snapshot
+            .secondary
+            .as_ref()
+            .map(limits::is_exhausted)
+            .unwrap_or(false)
+}
+
+fn passive_refresh_error_status(message: &str) -> &'static str {
+    let lower = message.to_lowercase();
+    if lower.contains("auth.json")
+        || lower.contains("access token")
+        || lower.contains("http 401")
+        || lower.contains("http 403")
+    {
+        "auth_failed"
+    } else {
+        "degraded"
+    }
 }
 
 fn first_line(s: &str) -> String {
