@@ -13,6 +13,7 @@ mod pool;
 mod resume;
 mod tmux;
 mod ui;
+mod usage;
 mod util;
 
 use anyhow::{anyhow, Context, Result};
@@ -144,7 +145,7 @@ enum Commands {
         #[arg(long, default_value_t = 20, help = "Maximum sessions to show")]
         limit: usize,
     },
-    #[command(about = "Refresh account health and local limit snapshots")]
+    #[command(about = "Refresh account health, usage, and reset-credit snapshots")]
     Refresh {
         #[arg(help = "Account name to refresh")]
         name: Option<String>,
@@ -250,6 +251,15 @@ enum AccountCommand {
         )]
         online: bool,
     },
+    #[command(about = "Show account usage and earned reset credits")]
+    Usage {
+        #[arg(help = "Account name")]
+        name: String,
+        #[arg(long, help = "Print JSON")]
+        json: bool,
+        #[command(subcommand)]
+        command: Option<UsageCommand>,
+    },
     #[command(about = "Disable an account for routing")]
     Disable {
         #[arg(help = "Account name")]
@@ -261,6 +271,17 @@ enum AccountCommand {
     Enable {
         #[arg(help = "Account name")]
         name: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum UsageCommand {
+    #[command(about = "Redeem one earned usage limit reset")]
+    Reset {
+        #[arg(long, help = "Redeem without an interactive confirmation prompt")]
+        yes: bool,
+        #[arg(long, help = "Print JSON")]
+        json: bool,
     },
 }
 
@@ -463,10 +484,37 @@ fn handle_account(conn: &Connection, command: AccountCommand) -> Result<()> {
             Some(name) => account::status(conn, &name, online),
             None => account::status_all(conn, online),
         },
+        AccountCommand::Usage {
+            name,
+            json,
+            command,
+        } => handle_account_usage(conn, &name, json, command),
         AccountCommand::Disable { name, reason } => {
             account::disable(conn, &name, reason.as_deref())
         }
         AccountCommand::Enable { name } => account::enable(conn, &name),
+    }
+}
+
+fn handle_account_usage(
+    conn: &Connection,
+    name: &str,
+    json: bool,
+    command: Option<UsageCommand>,
+) -> Result<()> {
+    match command {
+        Some(UsageCommand::Reset {
+            yes,
+            json: command_json,
+        }) => usage::reset(
+            conn,
+            name,
+            usage::ResetOptions {
+                yes,
+                json: json || command_json,
+            },
+        ),
+        None => usage::show(conn, name, usage::ShowOptions { json }),
     }
 }
 
@@ -817,6 +865,13 @@ fn is_account_shorthand(conn: &Connection, name: &str) -> Result<bool> {
 }
 
 fn run_account_shorthand(conn: &Connection, account_name: &str, rest: &[String]) -> Result<()> {
+    if rest.first().map(|arg| arg.as_str()) == Some("usage") {
+        return handle_account_usage_shorthand(conn, account_name, &rest[1..]);
+    }
+    if rest.first().map(|arg| arg.as_str()) == Some("refresh") {
+        return handle_account_refresh_shorthand(conn, account_name, &rest[1..]);
+    }
+
     let account = pool::choose(conn, Some(account_name), None, None)?;
     if rest.first().map(|arg| arg.as_str()) == Some("adopt") {
         let session = rest
@@ -840,6 +895,91 @@ fn run_account_shorthand(conn: &Connection, account_name: &str, rest: &[String])
         return run_resolved_codex(resolved, None);
     }
     run_codex_direct(&account.codex_home, None, &args)
+}
+
+fn handle_account_usage_shorthand(
+    conn: &Connection,
+    account_name: &str,
+    args: &[String],
+) -> Result<()> {
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        print_account_usage_shorthand_help(account_name);
+        return Ok(());
+    }
+
+    match args.first().map(|arg| arg.as_str()) {
+        Some("reset") => {
+            let (yes, json) = parse_reset_flags(&args[1..])?;
+            usage::reset(conn, account_name, usage::ResetOptions { yes, json })
+        }
+        _ => {
+            let json = parse_usage_show_flags(args)?;
+            usage::show(conn, account_name, usage::ShowOptions { json })
+        }
+    }
+}
+
+fn handle_account_refresh_shorthand(
+    conn: &Connection,
+    account_name: &str,
+    args: &[String],
+) -> Result<()> {
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        println!("Usage:");
+        println!("  cx {account_name} refresh [--stale]");
+        println!();
+        println!("Equivalent to `cx refresh {account_name}`.");
+        println!("Use `cx {account_name} -- refresh` to pass `refresh` through to Codex.");
+        return Ok(());
+    }
+
+    let stale_only = parse_refresh_shorthand_flags(args)?;
+    account::refresh(conn, &[account_name.to_string()], stale_only)
+}
+
+fn parse_usage_show_flags(args: &[String]) -> Result<bool> {
+    let mut json = false;
+    for arg in args {
+        match arg.as_str() {
+            "--json" => json = true,
+            "refresh" => anyhow::bail!("use `cx refresh <account>` to refresh account usage"),
+            other => anyhow::bail!("unknown usage option `{other}`"),
+        }
+    }
+    Ok(json)
+}
+
+fn parse_refresh_shorthand_flags(args: &[String]) -> Result<bool> {
+    let mut stale_only = false;
+    for arg in args {
+        match arg.as_str() {
+            "--stale" => stale_only = true,
+            other => anyhow::bail!("unknown refresh option `{other}`"),
+        }
+    }
+    Ok(stale_only)
+}
+
+fn parse_reset_flags(args: &[String]) -> Result<(bool, bool)> {
+    let mut yes = false;
+    let mut json = false;
+    for arg in args {
+        match arg.as_str() {
+            "--yes" | "--confirm" => yes = true,
+            "--json" => json = true,
+            other => anyhow::bail!("unknown usage reset option `{other}`"),
+        }
+    }
+    Ok((yes, json))
+}
+
+fn print_account_usage_shorthand_help(account_name: &str) {
+    println!("Usage:");
+    println!("  cx {account_name} usage [--json]");
+    println!("  cx {account_name} usage reset [--yes] [--json]");
+    println!();
+    println!("Use `cx refresh {account_name}` or `cx {account_name} refresh` to refresh usage.");
+    println!("Use `cx {account_name} -- usage` to pass `usage` through to Codex.");
 }
 
 fn run_resolved_codex(

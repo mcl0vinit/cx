@@ -27,6 +27,8 @@ pub struct LimitSnapshot {
     pub primary: Option<LimitWindow>,
     pub secondary: Option<LimitWindow>,
     pub credits: Option<Credits>,
+    #[serde(default)]
+    pub rate_limit_reset_credits: Option<RateLimitResetCredits>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,6 +43,43 @@ pub struct Credits {
     pub has_credits: Option<bool>,
     pub unlimited: Option<bool>,
     pub balance: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RateLimitResetCredits {
+    #[serde(alias = "availableCount")]
+    pub available_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConsumeRateLimitResetCreditResponse {
+    pub code: ConsumeRateLimitResetCreditCode,
+    #[serde(default)]
+    pub windows_reset: i64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsumeRateLimitResetCreditCode {
+    Reset,
+    NothingToReset,
+    NoCredit,
+    AlreadyRedeemed,
+}
+
+impl ConsumeRateLimitResetCreditCode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Reset => "reset",
+            Self::NothingToReset => "nothingToReset",
+            Self::NoCredit => "noCredit",
+            Self::AlreadyRedeemed => "alreadyRedeemed",
+        }
+    }
+
+    pub fn is_success(self) -> bool {
+        matches!(self, Self::Reset | Self::AlreadyRedeemed)
+    }
 }
 
 #[cfg(test)]
@@ -109,6 +148,41 @@ pub fn refresh_snapshot_from_backend(
     Ok(snapshot)
 }
 
+pub fn consume_rate_limit_reset_credit(
+    codex_home: &Path,
+    idempotency_key: &str,
+) -> Result<ConsumeRateLimitResetCreditResponse> {
+    if idempotency_key.trim().is_empty() {
+        anyhow::bail!("idempotency key must not be empty");
+    }
+
+    let auth_path = codex_home.join("auth.json");
+    let reset_url = reset_credit_url(codex_home);
+    let mut auth = read_auth_json(&auth_path)?;
+    let mut tokens = auth_tokens(&auth)?;
+
+    match post_backend_reset_credit(
+        &reset_url,
+        &tokens.access_token,
+        tokens.account_id.as_deref(),
+        idempotency_key,
+    ) {
+        Ok(response) => Ok(response),
+        Err(error) if error.is_unauthorized() && tokens.refresh_token.is_some() => {
+            auth = refresh_auth_json(&auth_path, &auth, tokens.refresh_token.take().unwrap())?;
+            tokens = auth_tokens(&auth)?;
+            post_backend_reset_credit(
+                &reset_url,
+                &tokens.access_token,
+                tokens.account_id.as_deref(),
+                idempotency_key,
+            )
+            .map_err(BackendFetchError::into_error)
+        }
+        Err(error) => Err(error.into_error()),
+    }
+}
+
 fn backend_snapshot(codex_home: &Path) -> Result<LimitSnapshot> {
     let auth_path = codex_home.join("auth.json");
     let usage_url = usage_url(codex_home);
@@ -142,6 +216,14 @@ fn backend_snapshot(codex_home: &Path) -> Result<LimitSnapshot> {
 }
 
 fn usage_url(codex_home: &Path) -> String {
+    backend_url(codex_home, "usage")
+}
+
+fn reset_credit_url(codex_home: &Path) -> String {
+    backend_url(codex_home, "rate-limit-reset-credits/consume")
+}
+
+fn backend_url(codex_home: &Path, path: &str) -> String {
     let mut base_url = config_chatgpt_base_url(codex_home)
         .unwrap_or_else(|| DEFAULT_CHATGPT_BASE_URL.to_string())
         .trim_end_matches('/')
@@ -154,9 +236,9 @@ fn usage_url(codex_home: &Path) -> String {
     }
 
     if base_url.contains("/backend-api") {
-        format!("{base_url}/wham/usage")
+        format!("{base_url}/wham/{path}")
     } else {
-        format!("{base_url}/api/codex/usage")
+        format!("{base_url}/api/codex/{path}")
     }
 }
 
@@ -257,6 +339,37 @@ fn fetch_backend_usage(
         .map_err(|error| BackendFetchError::Other(error.into()))
 }
 
+#[derive(Serialize)]
+struct ConsumeRateLimitResetCreditRequest<'a> {
+    redeem_request_id: &'a str,
+}
+
+fn post_backend_reset_credit(
+    reset_url: &str,
+    access_token: &str,
+    account_id: Option<&str>,
+    idempotency_key: &str,
+) -> std::result::Result<ConsumeRateLimitResetCreditResponse, BackendFetchError> {
+    let body = serde_json::to_string(&ConsumeRateLimitResetCreditRequest {
+        redeem_request_id: idempotency_key,
+    })
+    .map_err(|error| BackendFetchError::Other(error.into()))?;
+    let mut request = ureq::post(reset_url)
+        .set("Authorization", &format!("Bearer {access_token}"))
+        .set("Content-Type", "application/json")
+        .set("User-Agent", "codex-cli");
+    if let Some(account_id) = account_id {
+        request = request.set("ChatGPT-Account-ID", account_id);
+    }
+
+    let response = request.send_string(&body).map_err(backend_fetch_error)?;
+    let response_body = response
+        .into_string()
+        .map_err(|error| BackendFetchError::Other(error.into()))?;
+    serde_json::from_str::<ConsumeRateLimitResetCreditResponse>(&response_body)
+        .map_err(|error| BackendFetchError::Other(error.into()))
+}
+
 fn backend_fetch_error(error: ureq::Error) -> BackendFetchError {
     match error {
         ureq::Error::Status(status, response) => {
@@ -322,6 +435,7 @@ struct BackendUsagePayload {
     plan_type: Option<String>,
     rate_limit: Option<BackendRateLimit>,
     credits: Option<BackendCredits>,
+    rate_limit_reset_credits: Option<RateLimitResetCredits>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -366,6 +480,7 @@ fn snapshot_from_backend_payload(
             .and_then(|limits| limits.secondary_window.as_ref())
             .map(window_from_backend),
         credits: payload.credits.as_ref().map(credits_from_backend),
+        rate_limit_reset_credits: payload.rate_limit_reset_credits,
     }
 }
 
@@ -538,6 +653,13 @@ pub fn print_snapshot(snapshot: &LimitSnapshot) {
     if let Some(credits) = &snapshot.credits {
         print_credits(credits);
     }
+    if let Some(reset_credits) = &snapshot.rate_limit_reset_credits {
+        println!(
+            "{:<18} {}",
+            "Usage resets",
+            reset_credit_label(reset_credits.available_count)
+        );
+    }
 }
 
 fn print_window(label: &str, window: &LimitWindow) {
@@ -611,6 +733,10 @@ fn snapshot_from_value(
         primary: rate_limits.get("primary").and_then(window_from_value),
         secondary: rate_limits.get("secondary").and_then(window_from_value),
         credits: rate_limits.get("credits").and_then(credits_from_value),
+        rate_limit_reset_credits: rate_limits
+            .get("rate_limit_reset_credits")
+            .or_else(|| rate_limits.get("rateLimitResetCredits"))
+            .and_then(reset_credits_from_value),
     })
 }
 
@@ -631,6 +757,23 @@ fn credits_from_value(value: &Value) -> Option<Credits> {
         unlimited: value.get("unlimited").and_then(Value::as_bool),
         balance: value.get("balance").and_then(value_to_string),
     })
+}
+
+fn reset_credits_from_value(value: &Value) -> Option<RateLimitResetCredits> {
+    Some(RateLimitResetCredits {
+        available_count: value
+            .get("available_count")
+            .or_else(|| value.get("availableCount"))?
+            .as_i64()?,
+    })
+}
+
+pub fn reset_credit_label(count: i64) -> String {
+    if count == 1 {
+        "1 available".to_string()
+    } else {
+        format!("{count} available")
+    }
 }
 
 fn value_to_string(value: &Value) -> Option<String> {
@@ -784,7 +927,7 @@ mod tests {
             &file,
             [
                 r#"{"timestamp":"2026-06-15T12:00:00Z","type":"event_msg","payload":{"type":"token_count","rate_limits":{"limit_id":"codex","primary":{"used_percent":10.0,"window_minutes":300,"resets_at":1781528400},"secondary":{"used_percent":20.0,"window_minutes":10080,"resets_at":1782133200},"credits":{"has_credits":true,"unlimited":false,"balance":"12.50"},"plan_type":"plus"}}}"#,
-                r#"{"timestamp":"2026-06-15T12:05:00Z","type":"event_msg","payload":{"type":"token_count","rate_limits":{"limit_id":"codex","primary":{"used_percent":40.0,"window_minutes":300,"resets_at":1781528400},"secondary":{"used_percent":50.0,"window_minutes":10080,"resets_at":1782133200},"credits":{"has_credits":true,"unlimited":false,"balance":"11.25"},"plan_type":"plus"}}}"#,
+                r#"{"timestamp":"2026-06-15T12:05:00Z","type":"event_msg","payload":{"type":"token_count","rate_limits":{"limit_id":"codex","primary":{"used_percent":40.0,"window_minutes":300,"resets_at":1781528400},"secondary":{"used_percent":50.0,"window_minutes":10080,"resets_at":1782133200},"credits":{"has_credits":true,"unlimited":false,"balance":"11.25"},"rate_limit_reset_credits":{"available_count":2},"plan_type":"plus"}}}"#,
             ]
             .join("\n"),
         )
@@ -796,6 +939,13 @@ mod tests {
         assert_eq!(snapshot.primary.unwrap().used_percent, 40.0);
         assert_eq!(snapshot.secondary.unwrap().used_percent, 50.0);
         assert_eq!(snapshot.credits.unwrap().balance.as_deref(), Some("11.25"));
+        assert_eq!(
+            snapshot
+                .rate_limit_reset_credits
+                .as_ref()
+                .map(|credits| credits.available_count),
+            Some(2)
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -858,6 +1008,9 @@ mod tests {
                     "has_credits": false,
                     "unlimited": false,
                     "balance": "0"
+                },
+                "rate_limit_reset_credits": {
+                    "available_count": 3
                 }
             }"#,
         )
@@ -878,6 +1031,13 @@ mod tests {
         assert_eq!(secondary.used_percent, 71.0);
         assert_eq!(secondary.window_minutes, Some(10_080));
         assert_eq!(snapshot.credits.unwrap().balance.as_deref(), Some("0"));
+        assert_eq!(
+            snapshot
+                .rate_limit_reset_credits
+                .as_ref()
+                .map(|credits| credits.available_count),
+            Some(3)
+        );
     }
 
     #[test]
@@ -886,6 +1046,10 @@ mod tests {
         assert_eq!(
             usage_url(&default_home),
             "https://chatgpt.com/backend-api/wham/usage"
+        );
+        assert_eq!(
+            reset_credit_url(&default_home),
+            "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume"
         );
 
         let chatgpt_home = temp_root("usage-chatgpt");
@@ -899,6 +1063,10 @@ mod tests {
             usage_url(&chatgpt_home),
             "https://chatgpt.com/backend-api/wham/usage"
         );
+        assert_eq!(
+            reset_credit_url(&chatgpt_home),
+            "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume"
+        );
 
         let codex_home = temp_root("usage-codex-api");
         fs::create_dir_all(&codex_home).unwrap();
@@ -911,9 +1079,31 @@ mod tests {
             usage_url(&codex_home),
             "https://example.test/api/codex/usage"
         );
+        assert_eq!(
+            reset_credit_url(&codex_home),
+            "https://example.test/api/codex/rate-limit-reset-credits/consume"
+        );
 
         let _ = fs::remove_dir_all(default_home);
         let _ = fs::remove_dir_all(chatgpt_home);
         let _ = fs::remove_dir_all(codex_home);
+    }
+
+    #[test]
+    fn consume_reset_response_decodes_backend_outcomes() {
+        let response = serde_json::from_str::<ConsumeRateLimitResetCreditResponse>(
+            r#"{"code":"already_redeemed","windows_reset":2}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            response,
+            ConsumeRateLimitResetCreditResponse {
+                code: ConsumeRateLimitResetCreditCode::AlreadyRedeemed,
+                windows_reset: 2,
+            }
+        );
+        assert!(response.code.is_success());
+        assert_eq!(response.code.as_str(), "alreadyRedeemed");
     }
 }

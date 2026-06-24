@@ -98,6 +98,8 @@ cx personal resume <session-id>
 cx status
 cx watch --once
 cx explain
+cx personal usage
+cx refresh personal
 cx refresh --stale
 cx account status
 cx account status personal
@@ -173,13 +175,14 @@ Codex writes `rate_limits` snapshots into session JSONL files. `cx` reads the la
 - observed snapshot age
 - account health and active managed sessions
 
-`cx` caches the latest limit snapshot for each Codex home in `~/.cx/cx.sqlite`. On a cache miss it samples recent session files instead of parsing the full history tree. Explicit refreshes read Codex's account usage endpoint without starting a model turn.
+`cx` caches the latest limit snapshot for each Codex home in `~/.cx/cx.sqlite`. On a cache miss it samples recent session files instead of parsing the full history tree. Explicit refreshes read Codex's account usage endpoint, including earned reset-credit counts, without starting a model turn.
 
 Local read:
 
 ```bash
 cx account status
 cx account status personal
+cx personal usage
 cx watch --once
 ```
 
@@ -197,11 +200,21 @@ Refresh snapshots without spending a model turn:
 
 ```bash
 cx refresh personal
+cx personal refresh
 cx refresh --pool coding --stale
 cx refresh --all --stale
 ```
 
 `cx smart --refresh` refreshes stale or missing snapshots before picking an account.
+
+Redeem an earned usage-limit reset explicitly:
+
+```bash
+cx personal usage reset
+cx personal usage reset --yes
+```
+
+`cx` checks the account's current reset-credit count first, asks before spending a reset in interactive shells, consumes with an idempotency key, then refreshes usage. Use `cx personal -- usage` if Codex later adds a raw `usage` subcommand that you want to pass through unchanged.
 
 ### Smart Routing
 
@@ -405,6 +418,8 @@ cx account logout NAME
 cx account rename OLD NEW
 cx account list
 cx account status [NAME] [--online]
+cx account usage NAME [--json]
+cx account usage NAME reset [--yes] [--json]
 cx account check NAME [--online]
 cx account check --all [--online]
 cx account disable NAME [--reason TEXT]
@@ -432,6 +447,9 @@ cx sessions [--limit N]
 cx resume <session-id>
 cx resume --last
 cx resume-here [--account NAME | --pool NAME | --smart]
+cx NAME usage [--json]
+cx NAME usage reset [--yes] [--json]
+cx NAME refresh [--stale]
 cx NAME resume <session-id>
 cx NAME resume-here
 cx index [--sessions] [--limits] [--rebuild]
